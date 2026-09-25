@@ -1,0 +1,7 @@
+go 1.27.0
+
+use (
+	./go/cache
+	./go/redis
+	./go/sources/objectstorage
+)
