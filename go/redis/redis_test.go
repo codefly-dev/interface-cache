@@ -63,15 +63,17 @@ func startContainer() (string, error) {
 		return "", fmt.Errorf("docker is not usable: %w", err)
 	}
 	const password = "cachetest-secret"
+	// Only stdout carries the container ID: on a cold image cache, docker run
+	// reports pull progress on stderr.
 	out, err := exec.Command("docker", "run", "-d", "--rm", "-p", "127.0.0.1::6379",
-		redisImage, "redis-server", "--requirepass", password).CombinedOutput()
+		redisImage, "redis-server", "--requirepass", password).Output()
 	if err != nil {
-		return "", fmt.Errorf("docker run: %w: %s", err, out)
+		return "", fmt.Errorf("docker run: %w", withStderr(err))
 	}
 	containerID = strings.TrimSpace(string(out))
 	out, err = exec.Command("docker", "port", containerID, "6379/tcp").Output()
 	if err != nil {
-		return "", fmt.Errorf("docker port: %w", err)
+		return "", fmt.Errorf("docker port %s: %w", containerID, withStderr(err))
 	}
 	address := strings.TrimSpace(strings.Split(string(out), "\n")[0])
 	u := (&url.URL{Scheme: "redis", Host: address, User: url.UserPassword("", password)}).String()
@@ -90,6 +92,14 @@ func startContainer() (string, error) {
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
+}
+
+func withStderr(err error) error {
+	var exit *exec.ExitError
+	if errors.As(err, &exit) && len(exit.Stderr) > 0 {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(exit.Stderr)))
+	}
+	return err
 }
 
 func TestMain(m *testing.M) {
