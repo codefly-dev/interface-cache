@@ -91,10 +91,9 @@ service name waits on codefly-dev/core#655.
 The interface version (`definition/cache.json`) moves only when the contract
 changes: the definition or the Go API that consumers and drivers share. A driver
 fix does not move it. Modules are tagged per path (`go/cache/vX.Y.Z`,
-`go/sources/objectstorage/vX.Y.Z`). Until `go/cache` has its first tag, the
-other module builds against it with a `replace` directive, and `go.work` ties
-them together for development. A driver pins the `go/cache` version it
-implements.
+`go/sources/objectstorage/vX.Y.Z`). `go.work` ties them together for development;
+a released module requires a tagged `go/cache`. A driver pins the `go/cache`
+version it implements.
 
 ## Test
 
