@@ -62,11 +62,23 @@ Keep `-timeout 30m`: the first run installs the object-storage gateway.
   bump the interface version.
 - **The gateway version in `go/sources/objectstorage/go.mod` follows
   `service-object-storage` releases.** Move it with them.
+- **Partitioning lives in the Stack, never in a driver.** `Stack.scope` is the
+  one place a `Partition` becomes a layer key; the singleflight key, leases,
+  negative entries and notifications all follow from it. Do not add a partition
+  to `Layer`, `Leaser` or `Notifier`, and never give a Stack operation a default
+  partition: without one it fails closed. `RunStack`'s partition cases, run by
+  `TestMemoryStackFillOnce` here and by every driver's suite, hold it; a change
+  to the stack's keying must still be run against `service-redis/cache`.
+- **The cache stores data, never decisions.** Nothing here authorizes a read,
+  and docs or examples must not suggest a partition does.
 - **A lease is revoked by any write.** `Set`, `Delete` and expiry must all make
   a later `Fill` return `ErrLeaseLost`; `cachetest` holds every driver to it.
   That is what keeps a slow load from caching a value older than the write.
 - **Keep `go/cache` dependency-free.** Anything backend-specific goes in its own
-  module.
+  module. It never imports core or the SDK: a partition key is opaque here.
+- **An untagged contract change reaches the other modules by `replace`.** A
+  module that needs it points at `../../cache` until `go/cache` is tagged; the
+  release then tags `go/cache/vX.Y.Z`, requires it and drops the `replace`.
 
 ## Workflow
 

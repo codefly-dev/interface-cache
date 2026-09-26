@@ -9,6 +9,12 @@
 // collapses processes. An expired entry that carries a version is revalidated with a
 // conditional load, so an unchanged value never moves again.
 //
+// Every stack operation carries a Partition naming who may share its data, and
+// fails closed without one. The stack prefixes keys with it in every layer, so
+// values, fill leases, negative entries and invalidations never cross
+// partitions, and drivers never see one. The cache stores data, never
+// decisions: the caller's authorization check still runs before every read.
+//
 // Drivers implement Layer, and optionally Leaser (fill-once across processes)
 // and Notifier (evict in-process copies when another process writes). Origins
 // implement Source, and Store when writes should go through the stack. The

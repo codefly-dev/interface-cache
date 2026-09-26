@@ -16,3 +16,6 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260825221802-da73d73af1c5 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 )
+
+// Until go/cache v0.2.0 is tagged: the tests use the partitioned Stack API.
+replace github.com/codefly-dev/interface-cache/go/cache => ../../cache
