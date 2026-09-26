@@ -27,6 +27,18 @@ type Harness struct {
 	// must return independent clients that see the same data, the way two
 	// processes would; different namespaces must not see each other's keys.
 	New func(t *testing.T, namespace string) cache.Layer
+
+	// ExternalWrite, when set, changes key in namespace straight in the
+	// backend, bypassing the driver — the way another program, an operator or
+	// the server itself would (for Redis: a plain SET or DEL). The value
+	// written does not matter. With it, the suite checks that a Notifier
+	// reports changes by any writer, not only those made through a driver.
+	ExternalWrite func(t *testing.T, namespace, key string)
+
+	// Interrupt, required when the layer is a cache.Resyncer, breaks l's
+	// notification stream the way a dropped connection or a server restart
+	// would, so the suite can check that the gap is signalled.
+	Interrupt func(t *testing.T, l cache.Layer)
 }
 
 // Namespace returns a namespace no other test uses.
@@ -40,7 +52,9 @@ func Namespace(t *testing.T) string {
 }
 
 // Run checks the Layer contract, plus the Leaser and Notifier contracts when
-// the layer implements them.
+// the layer implements them. A Notifier must report other clients' writes, and
+// with ExternalWrite set, writes that bypass the driver; a Resyncer must signal
+// a gap after Interrupt and keep reporting after it.
 func Run(t *testing.T, h Harness) {
 	t.Run("Layer", func(t *testing.T) { runLayer(t, h) })
 	if _, ok := h.New(t, Namespace(t)).(cache.Leaser); ok {
@@ -256,52 +270,93 @@ func runLeaser(t *testing.T, h Harness) {
 
 func runNotifier(t *testing.T, h Harness) {
 	ctx := context.Background()
-	ns := Namespace(t)
-	a, b := h.New(t, ns).(cache.Notifier), h.New(t, ns).(cache.Notifier)
 
-	var mu sync.Mutex
-	seen := map[string][]string{}
-	record := func(who string) func(string) {
-		return func(key string) {
-			mu.Lock()
-			defer mu.Unlock()
-			seen[who] = append(seen[who], key)
+	// Every other client's write is reported. A client may also hear its own
+	// writes: the contract allows it, and the stack's eviction is idempotent.
+	t.Run("OtherClientsWrites", func(t *testing.T) {
+		ns := Namespace(t)
+		a, b := h.New(t, ns).(cache.Notifier), h.New(t, ns).(cache.Notifier)
+		heardA, heardB := subscribe(t, a), subscribe(t, b)
+
+		mustSet(t, a, "set-by-a", cache.Entry{Value: []byte("v")}, time.Minute)
+		if err := a.Delete(ctx, "deleted-by-a"); err != nil {
+			t.Fatal(err)
 		}
-	}
-	stopA, err := a.Subscribe(ctx, record("a"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer stopA()
-	stopB, err := b.Subscribe(ctx, record("b"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer stopB()
+		if err := b.Delete(ctx, "deleted-by-b"); err != nil {
+			t.Fatal(err)
+		}
+		heardB.wait(t, "set-by-a", "deleted-by-a")
+		heardA.wait(t, "deleted-by-b")
+	})
 
-	mustSet(t, a, "set-by-a", cache.Entry{Value: []byte("v")}, time.Minute)
-	if err := a.Delete(ctx, "deleted-by-a"); err != nil {
+	t.Run("ExternalWrites", func(t *testing.T) {
+		if h.ExternalWrite == nil {
+			t.Skip("the harness has no ExternalWrite")
+		}
+		ns := Namespace(t)
+		heard := subscribe(t, h.New(t, ns).(cache.Notifier))
+		h.ExternalWrite(t, ns, "written-externally")
+		heard.wait(t, "written-externally")
+	})
+
+	t.Run("Resync", func(t *testing.T) {
+		ns := Namespace(t)
+		l, ok := h.New(t, ns).(cache.Resyncer)
+		if !ok {
+			t.Skip("the layer is not a Resyncer: it must never lose a notice")
+		}
+		if h.Interrupt == nil {
+			t.Fatal("the layer is a Resyncer, so the harness must set Interrupt to prove it signals a gap")
+		}
+		var resyncs atomic.Int32
+		stop, err := l.SubscribeResync(ctx, func() { resyncs.Add(1) })
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer stop()
+		heard := subscribe(t, l)
+		h.Interrupt(t, l)
+		eventually(t, 10*time.Second, func() bool { return resyncs.Load() > 0 }, "an interrupted Resyncer never signalled the gap")
+		// Notices flow again after the signal.
+		other := h.New(t, ns)
+		mustSet(t, other, "after-the-gap", cache.Entry{Value: []byte("v")}, time.Minute)
+		heard.wait(t, "after-the-gap")
+	})
+}
+
+// heard collects the keys a Notifier reports.
+type heard struct {
+	mu   sync.Mutex
+	keys map[string]bool
+}
+
+func subscribe(t *testing.T, n cache.Notifier) *heard {
+	t.Helper()
+	h := &heard{keys: map[string]bool{}}
+	stop, err := n.Subscribe(context.Background(), func(key string) {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		h.keys[key] = true
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := b.Delete(ctx, "deleted-by-b"); err != nil {
-		t.Fatal(err)
-	}
+	t.Cleanup(stop)
+	return h
+}
+
+func (h *heard) wait(t *testing.T, keys ...string) {
+	t.Helper()
 	eventually(t, 3*time.Second, func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return len(seen["b"]) >= 2 && len(seen["a"]) >= 1
-	}, "notifications never arrived")
-
-	mu.Lock()
-	defer mu.Unlock()
-	if want := []string{"set-by-a", "deleted-by-a"}; !equalStrings(seen["b"], want) {
-		t.Fatalf("b heard %v, want %v", seen["b"], want)
-	}
-	// b's delete was published after a's writes, so by the time a hears it, a
-	// would also have heard its own writes had they been echoed back.
-	if want := []string{"deleted-by-b"}; !equalStrings(seen["a"], want) {
-		t.Fatalf("a heard %v, want only other clients' writes %v", seen["a"], want)
-	}
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		for _, key := range keys {
+			if !h.keys[key] {
+				return false
+			}
+		}
+		return true
+	}, fmt.Sprintf("the Notifier never reported all of %q", keys))
 }
 
 // RunStack checks the stack over the layer under test, shared by several
@@ -313,9 +368,66 @@ func runNotifier(t *testing.T, h Harness) {
 // partition reaches every partition's copy; an operation without a partition
 // fails and touches nothing; a write-around partition stores nothing; an
 // authorization revision bump, which changes the partition, misses.
+//
+// When the layer is a Notifier and ExternalWrite is set, a write that bypasses
+// the driver evicts the stack's in-process copy; when it is a Resyncer, a gap
+// flushes the stack's in-process tier.
 func RunStack(t *testing.T, h Harness) {
 	runFillOnce(t, h)
 	t.Run("Partitions", func(t *testing.T) { runPartitions(t, h) })
+	t.Run("ExternalWriteEvictsMemory", func(t *testing.T) { runExternalWriteEvicts(t, h) })
+	t.Run("ResyncFlushesMemory", func(t *testing.T) { runResyncFlushes(t, h) })
+}
+
+func runExternalWriteEvicts(t *testing.T, h Harness) {
+	ns := Namespace(t)
+	if _, ok := h.New(t, ns).(cache.Notifier); !ok || h.ExternalWrite == nil {
+		t.Skip("needs a Notifier and the harness's ExternalWrite")
+	}
+	ctx := context.Background()
+	p := newProcess(t, h, ns)
+	u := partitionOf("u")
+	if err := p.stack.Set(ctx, u, "k", []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	stored := p.shared.lastSet() // the key the stack wrote in the shared layer
+	assertGet(t, p.stack, "", u, "k", "v")
+	h.ExternalWrite(t, ns, stored)
+	eventually(t, 3*time.Second, func() bool {
+		p.shared.reset()
+		_, _ = p.stack.Get(ctx, u, "k")
+		return p.shared.calls() > 0
+	}, "a write that bypassed the driver never evicted the stack's in-process copy")
+}
+
+func runResyncFlushes(t *testing.T, h Harness) {
+	ns := Namespace(t)
+	if _, ok := h.New(t, ns).(cache.Resyncer); !ok {
+		t.Skip("the layer is not a Resyncer")
+	}
+	if h.Interrupt == nil {
+		t.Fatal("the layer is a Resyncer, so the harness must set Interrupt")
+	}
+	ctx := context.Background()
+	origin := newViewerOrigin()
+	p := newProcess(t, h, ns, cache.WithOrigin(origin))
+	plain := newProcess(t, h, ns)
+	for _, viewer := range []string{"u", "v"} {
+		assertGet(t, p.stack, viewer, partitionOf(viewer), "k", viewValue("k", viewer))
+		if err := plain.stack.Set(ctx, partitionOf(viewer), "k", []byte(viewer)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, x := range []process{p, plain} {
+		if x.top.Len() == 0 {
+			t.Fatal("the stack cached nothing in its in-process tier")
+		}
+		h.Interrupt(t, x.raw)
+	}
+	for _, x := range []process{p, plain} {
+		eventually(t, 10*time.Second, func() bool { return x.top.Len() == 0 },
+			"a resync left copies (of some partition or generation) in the in-process tier")
+	}
 }
 
 func runFillOnce(t *testing.T, h Harness) {
@@ -661,12 +773,14 @@ type process struct {
 	stack  *cache.Stack
 	top    *cache.Memory
 	shared *recorder
+	raw    cache.Layer // the layer under test, unwrapped, for Interrupt
 }
 
 func newProcess(t *testing.T, h Harness, namespace string, opts ...cache.Option) process {
 	t.Helper()
-	shared, rec := record(h.New(t, namespace))
-	p := process{top: cache.NewMemory(), shared: rec}
+	raw := h.New(t, namespace)
+	shared, rec := record(raw)
+	p := process{top: cache.NewMemory(), shared: rec, raw: raw}
 	s, err := cache.New(context.Background(), append([]cache.Option{
 		cache.WithTier(p.top, time.Minute),
 		cache.WithTier(shared, time.Minute),
@@ -699,10 +813,12 @@ func settle(t *testing.T, a, b process) {
 	}, "the other process never heard a's notices")
 }
 
-// recorder counts the calls a stack makes on the layer it wraps.
+// recorder counts the calls a stack makes on the layer it wraps, and keeps
+// the key of the last Set.
 type recorder struct {
-	mu sync.Mutex
-	n  int
+	mu  sync.Mutex
+	n   int
+	set string
 }
 
 func (r *recorder) called() {
@@ -717,25 +833,36 @@ func (r *recorder) calls() int {
 	return r.n
 }
 
+func (r *recorder) lastSet() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.set
+}
+
 func (r *recorder) reset() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.n = 0
 }
 
-// record wraps l so every call on it is counted, keeping its Leaser and
-// Notifier roles: the stack must treat the wrapped layer exactly as l.
-// Subscribe is not counted; the stack calls it once, when it is built.
+// record wraps l so every call on it is counted, keeping its Leaser,
+// Notifier and Resyncer roles: the stack must treat the wrapped layer exactly
+// as l. Subscriptions are not counted; the stack makes them once, when built.
 func record(l cache.Layer) (cache.Layer, *recorder) {
 	r := &recorder{}
 	base := recordedLayer{layer: l, r: r}
 	_, leases := l.(cache.Leaser)
 	_, notifies := l.(cache.Notifier)
+	_, resyncs := l.(cache.Resyncer)
 	switch {
+	case leases && resyncs:
+		return recordedLeaserResyncer{recordedLeaserNotifier{recordedLeaser{base}}}, r
 	case leases && notifies:
 		return recordedLeaserNotifier{recordedLeaser{base}}, r
 	case leases:
 		return recordedLeaser{base}, r
+	case resyncs:
+		return recordedResyncer{recordedNotifier{base}}, r
 	case notifies:
 		return recordedNotifier{base}, r
 	default:
@@ -755,6 +882,9 @@ func (x recordedLayer) Get(ctx context.Context, key string) (cache.Entry, error)
 
 func (x recordedLayer) Set(ctx context.Context, key string, e cache.Entry, ttl time.Duration) error {
 	x.r.called()
+	x.r.mu.Lock()
+	x.r.set = key
+	x.r.mu.Unlock()
 	return x.layer.Set(ctx, key, e, ttl)
 }
 
@@ -790,6 +920,18 @@ type recordedLeaserNotifier struct{ recordedLeaser }
 
 func (x recordedLeaserNotifier) Subscribe(ctx context.Context, fn func(key string)) (func(), error) {
 	return x.layer.(cache.Notifier).Subscribe(ctx, fn)
+}
+
+type recordedResyncer struct{ recordedNotifier }
+
+func (x recordedResyncer) SubscribeResync(ctx context.Context, fn func()) (func(), error) {
+	return x.layer.(cache.Resyncer).SubscribeResync(ctx, fn)
+}
+
+type recordedLeaserResyncer struct{ recordedLeaserNotifier }
+
+func (x recordedLeaserResyncer) SubscribeResync(ctx context.Context, fn func()) (func(), error) {
+	return x.layer.(cache.Resyncer).SubscribeResync(ctx, fn)
 }
 
 // viewerOrigin answers according to who asks, the way an origin that
@@ -984,16 +1126,4 @@ func eventually(t *testing.T, within time.Duration, cond func() bool, msg string
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal(msg)
-}
-
-func equalStrings(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }

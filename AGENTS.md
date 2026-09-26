@@ -75,6 +75,11 @@ Keep `-timeout 30m`: the first run installs the object-storage gateway.
   it on every write; never mint one over an existing generation (the lease
   holder re-reads before it fills). `WritesReachEveryPartition` fails without
   each of these.
+- **A Notifier reports changes by any writer, or says it lost some.** A driver
+  whose notices can be lost implements `Resyncer`, and its harness sets
+  `Interrupt`; a harness that can write around the driver sets
+  `ExternalWrite`. Never weaken those cases to fit a driver: a driver that fails
+  them serves stale copies until TTL. A driver may report its own writes.
 - **The cache stores data, never decisions.** Nothing here authorizes a read,
   and docs or examples must not suggest a partition does.
 - **A lease is revoked by any write.** `Set`, `Delete` and expiry must all make

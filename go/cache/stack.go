@@ -48,12 +48,19 @@ type Stack struct {
 
 	flight singleflight.Group
 	stops  []func()
+
+	// resyncMu orders resyncs against fills of the tiers they flush: a fill
+	// that read before a resync must not store into a tier it flushed.
+	resyncMu sync.RWMutex
+	resyncs  uint64
 }
 
 type tier struct {
 	layer   Layer
 	ttl     time.Duration
 	breaker *breaker
+	// flushed marks a tier above a Resyncer, which a resync empties.
+	flushed bool
 }
 
 // Option configures a Stack.
@@ -166,7 +173,8 @@ func WithGlobal() Option {
 }
 
 // New builds a stack. It needs at least one layer or an origin. Layers that are
-// Notifiers are subscribed here, so New fails when one cannot be reached.
+// Notifiers are subscribed here, so New fails when one cannot be reached. Every
+// layer above a Resyncer must be a Flusher.
 func New(ctx context.Context, opts ...Option) (*Stack, error) {
 	s := &Stack{
 		negativeTTL:     5 * time.Second,
@@ -194,6 +202,16 @@ func New(ctx context.Context, opts ...Option) (*Stack, error) {
 			continue
 		}
 		above := s.tiers[:i]
+		resyncer, resyncs := notifier.(Resyncer)
+		if resyncs {
+			for j, a := range above {
+				if _, ok := a.layer.(Flusher); !ok {
+					s.Close()
+					return nil, fmt.Errorf("cache: tier %d is above tier %d, which can lose invalidations, but cannot be flushed on a resync (it is not a Flusher)", j, i)
+				}
+				a.flushed = true
+			}
+		}
 		stop, err := notifier.Subscribe(ctx, func(key string) {
 			for _, a := range above {
 				_ = a.layer.Delete(context.Background(), key)
@@ -204,8 +222,35 @@ func New(ctx context.Context, opts ...Option) (*Stack, error) {
 			return nil, fmt.Errorf("cache: subscribe to invalidations of tier %d: %w", i, err)
 		}
 		s.stops = append(s.stops, stop)
+		if resyncs {
+			stop, err := resyncer.SubscribeResync(ctx, func() { s.resync(above) })
+			if err != nil {
+				s.Close()
+				return nil, fmt.Errorf("cache: subscribe to resyncs of tier %d: %w", i, err)
+			}
+			s.stops = append(s.stops, stop)
+		}
 	}
 	return s, nil
+}
+
+// resync empties the tiers above a Resyncer that may have lost notices: any
+// of their copies, of any partition, and any generation they hold may be
+// stale. Fills that read before it store nothing into them.
+func (s *Stack) resync(above []*tier) {
+	s.resyncMu.Lock()
+	defer s.resyncMu.Unlock()
+	s.resyncs++
+	for _, t := range above {
+		_ = t.layer.(Flusher).Flush(context.Background())
+	}
+}
+
+// since returns the resync count a read starts from.
+func (s *Stack) since() uint64 {
+	s.resyncMu.RLock()
+	defer s.resyncMu.RUnlock()
+	return s.resyncs
 }
 
 // Close stops the stack's invalidation subscriptions. It does not close the
@@ -248,15 +293,19 @@ func (s *Stack) GetEntry(ctx context.Context, p Partition, key string) (Entry, e
 	if p.writeAround {
 		return s.loadAround(ctx, key)
 	}
+	// One resync snapshot for the whole read: a generation read before a
+	// resync may be one the resync exists to drop.
+	since := s.since()
 	if s.origin == nil {
-		return s.read(ctx, fill{layer: p.layerKey(key)})
+		return s.read(ctx, fill{layer: p.layerKey(key), since: since})
 	}
-	generation, err := s.generation(ctx, key)
+	generation, err := s.generation(ctx, since, key)
 	if err != nil {
 		return Entry{}, err
 	}
 	return s.read(ctx, fill{
 		layer: p.entryKey(generation, key),
+		since: since,
 		load: func(ctx context.Context, ifNot string) (Entry, error) {
 			return s.origin.Load(ctx, key, ifNot)
 		},
@@ -282,6 +331,9 @@ func (s *Stack) check(p Partition) error {
 // the partition and the generation.
 type fill struct {
 	layer string
+	// since is the resync count when the operation began; what it found must
+	// not be stored into a flushed tier after a later resync.
+	since uint64
 	// load returns the value for layer; nil means the layers are all there
 	// is, and a miss is ErrMiss.
 	load func(ctx context.Context, ifNot string) (Entry, error)
@@ -306,7 +358,7 @@ func (s *Stack) read(ctx context.Context, f fill) (Entry, error) {
 		}
 		t.breaker.success()
 		if e.Fresh(now) {
-			s.fillAbove(ctx, i, f.layer, e)
+			s.fillAbove(ctx, f.since, i, f.layer, e)
 			return e, nil
 		}
 		if stale == nil {
@@ -323,11 +375,11 @@ func (s *Stack) read(ctx context.Context, f fill) (Entry, error) {
 // processes, like any fill — when no layer holds it. It must be read before
 // the origin is loaded: a fill is stored under the generation current when
 // its load started, so a write that lands during the load orphans it.
-func (s *Stack) generation(ctx context.Context, key string) (string, error) {
+func (s *Stack) generation(ctx context.Context, since uint64, key string) (string, error) {
 	if len(s.tiers) == 0 {
 		return "", nil // nothing is stored, so nothing needs invalidating
 	}
-	e, err := s.read(ctx, fill{layer: generationKey(key), load: mintGeneration})
+	e, err := s.read(ctx, fill{layer: generationKey(key), load: mintGeneration, since: since})
 	if err != nil {
 		return "", err
 	}
@@ -413,7 +465,7 @@ func (s *Stack) loadShared(ctx context.Context, f fill, stale *Entry) (Entry, er
 			if e, err := leaser.Get(ctx, f.layer); err == nil {
 				if e.Fresh(s.now()) {
 					_ = leaser.Release(ctx, lease)
-					s.fillAbove(ctx, idx, f.layer, e)
+					s.fillAbove(ctx, f.since, idx, f.layer, e)
 					return e, nil
 				}
 				if stale == nil {
@@ -427,7 +479,7 @@ func (s *Stack) loadShared(ctx context.Context, f fill, stale *Entry) (Entry, er
 			return Entry{}, err
 		}
 		if filled {
-			s.fillAbove(ctx, idx, f.layer, e)
+			s.fillAbove(ctx, f.since, idx, f.layer, e)
 			return e, nil
 		}
 		if !s.now().Before(giveUp) {
@@ -496,7 +548,7 @@ func (s *Stack) loadOrigin(ctx context.Context, f fill, stale *Entry, skip int, 
 	if lease != nil {
 		t := s.tiers[skip]
 		stored, ttl := s.stamp(e, t.ttl, now)
-		err := t.layer.(Leaser).Fill(ctx, *lease, stored, ttl)
+		err := s.fillLeased(ctx, f.since, t, *lease, stored, ttl)
 		switch {
 		case errors.Is(err, ErrLeaseLost):
 			return e, nil
@@ -510,15 +562,30 @@ func (s *Stack) loadOrigin(ctx context.Context, f fill, stale *Entry, skip int, 
 			continue
 		}
 		stored, ttl := s.stamp(e, t.ttl, now)
-		s.store(ctx, t, f.layer, stored, ttl)
+		s.store(ctx, f.since, t, f.layer, stored, ttl)
 	}
 	stored, _ := s.stamp(e, s.shortestTTL(), now)
 	return stored, nil
 }
 
+// fillLeased stores e under lease, unless the leasing tier is flushed and a
+// resync came after the fill's read began: the lease is then given up.
+func (s *Stack) fillLeased(ctx context.Context, since uint64, t *tier, lease Lease, e Entry, ttl time.Duration) error {
+	leaser := t.layer.(Leaser)
+	if t.flushed {
+		s.resyncMu.RLock()
+		defer s.resyncMu.RUnlock()
+		if s.resyncs != since {
+			_ = leaser.Release(ctx, lease)
+			return ErrLeaseLost
+		}
+	}
+	return leaser.Fill(ctx, lease, e, ttl)
+}
+
 // fillAbove copies an entry found in tier i into the tiers above it, never
 // fresher than it was below.
-func (s *Stack) fillAbove(ctx context.Context, i int, key string, e Entry) {
+func (s *Stack) fillAbove(ctx context.Context, since uint64, i int, key string, e Entry) {
 	now := s.now()
 	for _, t := range s.tiers[:i] {
 		stored, ttl := s.stamp(e, t.ttl, now)
@@ -530,7 +597,7 @@ func (s *Stack) fillAbove(ctx context.Context, i int, key string, e Entry) {
 			}
 		}
 		if ttl > 0 {
-			s.store(ctx, t, key, stored, ttl)
+			s.store(ctx, since, t, key, stored, ttl)
 		}
 	}
 }
@@ -551,10 +618,18 @@ func (s *Stack) stamp(e Entry, ttl time.Duration, now time.Time) (Entry, time.Du
 	return e, ttl
 }
 
-// store is a best-effort fill: a layer the breaker is skipping is left alone.
-func (s *Stack) store(ctx context.Context, t *tier, key string, e Entry, ttl time.Duration) {
+// store is a best-effort fill: a layer the breaker is skipping is left alone,
+// and so is a flushed tier after a resync the fill's read began before.
+func (s *Stack) store(ctx context.Context, since uint64, t *tier, key string, e Entry, ttl time.Duration) {
 	if !t.breaker.allow() {
 		return
+	}
+	if t.flushed {
+		s.resyncMu.RLock()
+		defer s.resyncMu.RUnlock()
+		if s.resyncs != since {
+			return
+		}
 	}
 	err := t.layer.Set(ctx, key, e, ttl)
 	if err != nil && !errors.Is(err, ErrTooLarge) {

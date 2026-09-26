@@ -17,7 +17,7 @@ runtime. Roadmap: [codefly-dev/.github#7](https://github.com/codefly-dev/.github
 |---|---|
 | `definition/cache.json` | The published interface: kind `capability`, the `cache` configuration group (`driver`; `connection`, secret). Providers are held to it. |
 | `go/cache` | `Layer`, `Source`, `Store`, `Partition`, the `Stack` (any number of layers), `Open` + driver registry, `Typed[T]`, and `Memory`: a complete in-process backend (leases, notifications; `Share()` gives several stacks one store). Depends on nothing but `golang.org/x/sync`. |
-| `go/cache/cachetest` | Conformance suite: `Run` (Layer, Leaser, Notifier contracts) and `RunStack` (fill-once across processes, partition isolation). |
+| `go/cache/cachetest` | Conformance suite: `Run` (Layer, Leaser, Notifier and Resyncer contracts) and `RunStack` (fill-once across processes, partition isolation, eviction on external writes and resyncs). A harness may provide `ExternalWrite` (change a key bypassing the driver) and must provide `Interrupt` for a Resyncer. |
 | `go/sources/objectstorage` | Origin adapter over the object-storage gateway client: loads conditional on ETag. Safe only behind the consumer's own authorization check (see [Partitions](#partitions-and-authorization)). |
 
 Each directory under `go/` is its own module. This repository holds no backend
@@ -141,9 +141,17 @@ Every `Stack` operation takes a `Partition`:
   replace the key's generation; `WriteThrough` also stores the new value as the
   writer's copy. Over a read-only origin they are `ErrReadOnlyOrigin`. With no
   origin, the stack is a plain cache.
-- **Invalidation across processes.** A `Notifier` layer (Redis) reports keys
-  other processes changed, including generations, and the stack evicts them
-  from the layers above it.
+- **Invalidation across processes.** A `Notifier` layer (optional) reports every
+  key that changed in it, by any writer: another process through its driver, a
+  client that bypasses the driver, or the server. The stack evicts the key,
+  generations included, from the layers above it. A Notifier may also report
+  its own client's writes; eviction is idempotent.
+- **Resync.** A Notifier either never loses a notice (Memory) or is a
+  `Resyncer`, which signals each gap in which notices may have been lost. On
+  the signal the stack flushes every layer above it, every partition and
+  generation alike, since it cannot know which keys changed; those layers must
+  be `Flusher`s (Memory is), or `New` refuses the stack. A fill whose read
+  began before the resync stores nothing in them.
 - **Degrade.** A failing layer is skipped behind a breaker; reads fall through
   to the next layer or the origin. `Invalidate` is always attempted and reports
   failures, because a missed invalidation serves stale data.
@@ -155,13 +163,16 @@ Every `Stack` operation takes a `Partition`:
 - Until the breaker opens (default 5 failures), each read pays the driver's
   timeouts and retries against an unreachable server; drivers document how to
   tune them.
-- Invalidation notices may be lossy (Redis pub/sub is): a missed notice leaves
-  the key in the layers above until their own TTL. Keep in-process TTLs short
-  relative to how stale a value may be. This covers generations too: a process
-  that misses a write's notice keeps reading copies under the old generation
-  until its in-process tier drops it, at most that tier's TTL.
-- Writes that bypass the stack reach cached copies only through TTL, or through
-  an explicit `Stack.Invalidate`, which reaches every partition.
+- Notices arrive after the write: until one arrives, the layers above keep
+  serving the old copy. Between a gap and its resync signal they may serve
+  copies of any key that changed during it. A Notifier that loses notices
+  without signalling breaks the contract, and leaves those copies until their
+  TTL.
+- Without a Notifier, layers above are bounded only by their TTL: keep
+  in-process TTLs short relative to how stale a value may be.
+- Writes to the origin that bypass the stack reach cached copies only through
+  TTL, or through an explicit `Stack.Invalidate`, which reaches every
+  partition.
 - Processes on different interface versions must not share a layer: they key
   it differently, so neither invalidates the other's copies. Upgrade them
   together, or point the new version at an empty keyspace.
@@ -182,9 +193,12 @@ implements.
 
 0.2.0 is a breaking change: every `Stack` and `Typed` operation takes a
 `Partition`, the stack's keys in a layer change (see Limits), and `RunStack`
-gains the partition cases under a `Partitions` subtest. The `Layer`, `Leaser`
-and `Notifier` contracts are unchanged, so a driver moves by bumping its
-`go/cache` requirement; its tests that call the stack pass a partition.
+gains the partition cases under a `Partitions` subtest. The Notifier contract
+changes: it reports changes by any writer, may report its own client's
+writes, and a Notifier that can lose notices must be a `Resyncer`. A driver
+whose notifications carry only what drivers publish (Redis pub/sub) no longer
+conforms. `Layer` and `Leaser` are unchanged; the Memory layer is also a
+`Flusher`.
 
 ## Test
 

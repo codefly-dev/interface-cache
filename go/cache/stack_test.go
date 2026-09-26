@@ -15,25 +15,113 @@ import (
 )
 
 // sharedMemory hands out clients of one store per namespace, the way several
-// processes hold clients of one server.
+// processes hold clients of one server. An external write goes through a
+// client no stack uses, as another program would.
 func sharedMemory() cachetest.Harness {
+	return memoryHarness(func(m *cache.Memory) cache.Layer { return m })
+}
+
+// memoryHarness is sharedMemory with each client wrapped by wrap.
+func memoryHarness(wrap func(*cache.Memory) cache.Layer) cachetest.Harness {
 	var mu sync.Mutex
 	stores := map[string]*cache.Memory{}
-	return cachetest.Harness{New: func(_ *testing.T, ns string) cache.Layer {
+	store := func(ns string) *cache.Memory {
 		mu.Lock()
 		defer mu.Unlock()
-		if m, ok := stores[ns]; ok {
-			return m.Share()
+		if _, ok := stores[ns]; !ok {
+			stores[ns] = cache.NewMemory()
 		}
-		stores[ns] = cache.NewMemory()
 		return stores[ns]
-	}}
+	}
+	return cachetest.Harness{
+		New: func(_ *testing.T, ns string) cache.Layer { return wrap(store(ns).Share()) },
+		ExternalWrite: func(t *testing.T, ns, key string) {
+			if err := store(ns).Share().Set(context.Background(), key, cache.Entry{Value: []byte("external")}, time.Minute); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
 }
 
 // tenant is the partition the tests that are not about partitioning read in.
 var tenant = cache.NewPartition("tenant")
 
 func TestMemoryConformance(t *testing.T) { cachetest.Run(t, sharedMemory()) }
+
+// echoMemory reports its own client's writes too, which the Notifier contract
+// allows: it subscribes through another client of the store.
+type echoMemory struct{ *cache.Memory }
+
+func (e echoMemory) Subscribe(ctx context.Context, fn func(string)) (func(), error) {
+	return e.Share().Subscribe(ctx, fn)
+}
+
+// A driver that reports its own writes passes the suite, and the stack over it
+// behaves the same.
+func TestEchoingNotifierConformance(t *testing.T) {
+	h := memoryHarness(func(m *cache.Memory) cache.Layer { return echoMemory{m} })
+	cachetest.Run(t, h)
+	cachetest.RunStack(t, h)
+}
+
+// lossyMemory is a Resyncer over Memory: during a gap it drops the notices
+// that arrive, then signals the resync, as a driver whose connection dropped
+// would.
+type lossyMemory struct {
+	*cache.Memory
+	mu      *sync.Mutex
+	dropped *bool
+	resyncs *[]func()
+}
+
+func newLossyMemory(m *cache.Memory) lossyMemory {
+	return lossyMemory{Memory: m, mu: &sync.Mutex{}, dropped: new(bool), resyncs: new([]func())}
+}
+
+func (l lossyMemory) Subscribe(ctx context.Context, fn func(string)) (func(), error) {
+	return l.Memory.Subscribe(ctx, func(key string) {
+		l.mu.Lock()
+		lost := *l.dropped
+		l.mu.Unlock()
+		if !lost {
+			fn(key)
+		}
+	})
+}
+
+func (l lossyMemory) SubscribeResync(_ context.Context, fn func()) (func(), error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	*l.resyncs = append(*l.resyncs, fn)
+	return func() {}, nil
+}
+
+// interrupt opens a gap, runs lose inside it, then closes it and signals.
+func (l lossyMemory) interrupt(lose func()) {
+	l.mu.Lock()
+	*l.dropped = true
+	l.mu.Unlock()
+	lose()
+	l.mu.Lock()
+	*l.dropped = false
+	fns := append([]func(){}, *l.resyncs...)
+	l.mu.Unlock()
+	for _, fn := range fns {
+		fn()
+	}
+}
+
+func lossyHarness() cachetest.Harness {
+	h := memoryHarness(func(m *cache.Memory) cache.Layer { return newLossyMemory(m) })
+	h.Interrupt = func(_ *testing.T, l cache.Layer) { l.(lossyMemory).interrupt(func() {}) }
+	return h
+}
+
+// The resync contract cases run against a Resyncer, and pass.
+func TestResyncerConformance(t *testing.T) {
+	cachetest.Run(t, lossyHarness())
+	cachetest.RunStack(t, lossyHarness())
+}
 
 // Two stacks, each with a private Memory over one shared Memory: the origin is
 // loaded once, which only holds if the stack leases on the deepest layer.
@@ -629,5 +717,130 @@ func TestWriteAroundOverStore(t *testing.T) {
 	assertStoresNoCopy("delete")
 	if _, err := s.Get(ctx, tenant, "k"); !errors.Is(err, cache.ErrNotFound) {
 		t.Fatalf("Get after a write-around Delete = %v, want ErrNotFound", err)
+	}
+}
+
+// A notice lost in a gap leaves a stale copy above the Resyncer; the resync
+// that follows flushes it, in every partition and generation.
+func TestResyncFlushesWhatAGapLost(t *testing.T) {
+	ctx := context.Background()
+	o := newOrigin()
+	o.put("k", "old")
+	shared := cache.NewMemory()
+	lossy := newLossyMemory(shared.Share())
+	top := cache.NewMemory()
+	s := newStack(t, cache.WithTier(top, time.Hour), cache.WithTier(lossy, time.Hour), cache.WithOrigin(o))
+	writer := newStack(t, cache.WithTier(shared.Share(), time.Hour), cache.WithOrigin(o))
+	other := cache.NewPartition("other")
+	assertGet(t, s, "k", "old")
+	if got, err := s.Get(ctx, other, "k"); err != nil || string(got) != "old" {
+		t.Fatalf("Get = %q, %v", got, err)
+	}
+
+	lossy.interrupt(func() {
+		if err := writer.Set(ctx, tenant, "k", []byte("new")); err != nil {
+			t.Fatal(err)
+		}
+		assertGet(t, s, "k", "old") // the notice was lost: the stale copy is served
+	})
+	if top.Len() != 0 {
+		t.Fatalf("the resync left %d entries in the tier above", top.Len())
+	}
+	assertGet(t, s, "k", "new")
+	if got, err := s.Get(ctx, other, "k"); err != nil || string(got) != "new" {
+		t.Fatalf("other partition after the resync = %q, %v", got, err)
+	}
+}
+
+// A fill whose read began before a resync stores nothing in the flushed tier:
+// what it read may be what the gap left stale.
+func TestFillDuringResyncIsNotStoredAbove(t *testing.T) {
+	o := newOrigin()
+	o.put("k", "v")
+	o.delay = 100 * time.Millisecond
+	lossy := newLossyMemory(cache.NewMemory())
+	top := cache.NewMemory()
+	s := newStack(t, cache.WithTier(top, time.Hour), cache.WithTier(lossy, time.Hour), cache.WithOrigin(o))
+
+	done := make(chan struct{})
+	go func() { defer close(done); assertGet(t, s, "k", "v") }()
+	time.Sleep(30 * time.Millisecond) // the origin load is running
+	lossy.interrupt(func() {})
+	<-done
+	if e, err := top.Get(context.Background(), cache.EntryKey(s, tenant, "k")); !errors.Is(err, cache.ErrMiss) {
+		t.Fatalf("a fill that began before the resync was stored above it: %q, %v", e.Value, err)
+	}
+}
+
+// A resync cannot name keys, so every tier above a Resyncer must be flushable.
+func TestNewRefusesUnflushableTierAboveResyncer(t *testing.T) {
+	_, err := cache.New(context.Background(),
+		cache.WithTier(&brokenLayer{}, time.Minute),
+		cache.WithTier(newLossyMemory(cache.NewMemory()), time.Minute),
+	)
+	if err == nil || !strings.Contains(err.Error(), "cannot be flushed") {
+		t.Fatalf("New = %v, want a refusal naming the unflushable tier", err)
+	}
+}
+
+// gatedLayer holds a Get of a copy that misses, for the caller whose context
+// carries hold, until release is closed: that reader has missed, and is slow
+// to act on it.
+type gatedLayer struct {
+	*cache.Memory
+	hold    any
+	missed  chan struct{}
+	release chan struct{}
+}
+
+func (g gatedLayer) Get(ctx context.Context, key string) (cache.Entry, error) {
+	e, err := g.Memory.Get(ctx, key)
+	if errors.Is(err, cache.ErrMiss) && ctx.Value(g.hold) != nil {
+		close(g.missed)
+		<-g.release
+	}
+	return e, err
+}
+
+// The fill-once race reported from service-redis#79: a reader misses just
+// before another process fills, and reaches its load only after its own
+// process's flight for the key has finished, so it starts a new flight whose
+// lease is free — the fill released it. The lease holder re-reads the key
+// before loading, so the origin is still loaded once.
+func TestLateMissAfterAnotherProcessFilledLoadsOnce(t *testing.T) {
+	type holdKey struct{}
+	o := newOrigin()
+	o.put("k", "v")
+	o.delay = 100 * time.Millisecond
+	shared := cache.NewMemory()
+	gate := gatedLayer{Memory: shared.Share(), hold: holdKey{}, missed: make(chan struct{}), release: make(chan struct{})}
+	a := newStack(t, cache.WithTier(shared, time.Hour), cache.WithOrigin(o))
+	b := newStack(t, cache.WithTier(cache.NewMemory(), time.Hour), cache.WithTier(gate, time.Hour), cache.WithOrigin(o))
+
+	// Both processes learn the generation first, so the late reader's miss is
+	// on the copy.
+	if _, err := b.Get(context.Background(), cache.NewPartition("warm"), "k"); err != nil {
+		t.Fatal(err)
+	}
+	loads := o.loads.Load()
+
+	aDone := make(chan struct{})
+	go func() { defer close(aDone); assertGet(t, a, "k", "v") }() // a takes the lease and loads
+	time.Sleep(20 * time.Millisecond)
+	late := make(chan struct{})
+	go func() {
+		defer close(late)
+		ctx := context.WithValue(context.Background(), holdKey{}, true)
+		if got, err := b.Get(ctx, tenant, "k"); err != nil || string(got) != "v" {
+			t.Errorf("late reader = %q, %v", got, err)
+		}
+	}()
+	<-gate.missed
+	assertGet(t, b, "k", "v") // b's own flight waits for a's fill, and finishes
+	<-aDone
+	close(gate.release) // the late reader reaches load now, after a's fill
+	<-late
+	if n := o.loads.Load() - loads; n != 1 {
+		t.Fatalf("origin loaded %d times, want 1", n)
 	}
 }

@@ -10,7 +10,7 @@ func EntryKey(s *Stack, p Partition, key string) string {
 	}
 	generation := ""
 	if len(s.tiers) > 0 {
-		e, err := s.read(context.Background(), fill{layer: generationKey(key)})
+		e, err := s.read(context.Background(), fill{layer: generationKey(key), since: s.since()})
 		if err != nil {
 			return ""
 		}
