@@ -2,11 +2,11 @@
 // stack of cache layers over an optional authoritative origin.
 //
 // A consumer composes caching; nothing it caches knows about it. The stack is
-// read top-down — an in-process Memory layer, then shared layers such as the
-// Redis driver, then the origin (object storage, a database, a remote API) —
-// and filled bottom-up. A miss reaches the origin once: singleflight collapses
-// callers inside a process, and a lease on the first shared layer collapses
-// processes. An expired entry that carries a version is revalidated with a
+// read top-down through any number of layers — say an in-process Memory, then
+// a shared Redis — down to the origin (object storage, a database, a remote
+// API), and filled bottom-up. A miss reaches the origin once: singleflight
+// collapses callers inside a process, and a lease on the deepest leasing layer
+// collapses processes. An expired entry that carries a version is revalidated with a
 // conditional load, so an unchanged value never moves again.
 //
 // Drivers implement Layer, and optionally Leaser (fill-once across processes)

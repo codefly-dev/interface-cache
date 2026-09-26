@@ -267,9 +267,8 @@ func (s *Stack) load(ctx context.Context, key string, stale *Entry) (Entry, erro
 	}
 }
 
-// loadShared collapses misses across processes: the first shared layer that
-// grants leases decides which process loads the origin; the others wait for
-// its fill.
+// loadShared collapses misses across processes: the deepest layer that grants
+// leases decides which process loads the origin; the others wait for its fill.
 func (s *Stack) loadShared(ctx context.Context, key string, stale *Entry) (Entry, error) {
 	idx, leaser := s.leaser()
 	if leaser == nil {
@@ -426,8 +425,13 @@ func (s *Stack) store(ctx context.Context, t *tier, key string, e Entry, ttl tim
 	}
 }
 
+// leaser picks the layer that coordinates fills: the deepest one that grants
+// leases, because the layer closest to the origin is the one most widely
+// shared. A private Memory above a shared Redis also grants leases, but only
+// within its own process, which singleflight already covers.
 func (s *Stack) leaser() (int, Leaser) {
-	for i, t := range s.tiers {
+	for i := len(s.tiers) - 1; i >= 0; i-- {
+		t := s.tiers[i]
 		if l, ok := t.layer.(Leaser); ok && t.breaker.allow() {
 			return i, l
 		}

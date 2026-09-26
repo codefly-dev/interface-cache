@@ -3,6 +3,7 @@ package cache_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,16 +14,108 @@ import (
 	"github.com/codefly-dev/interface-cache/go/cache/cachetest"
 )
 
-func TestMemoryConformance(t *testing.T) {
-	cachetest.Run(t, cachetest.Harness{
-		New: func(*testing.T, string) cache.Layer { return cache.NewMemory() },
-	})
+// sharedMemory hands out clients of one store per namespace, the way several
+// processes hold clients of one server.
+func sharedMemory() cachetest.Harness {
+	var mu sync.Mutex
+	stores := map[string]*cache.Memory{}
+	return cachetest.Harness{New: func(_ *testing.T, ns string) cache.Layer {
+		mu.Lock()
+		defer mu.Unlock()
+		if m, ok := stores[ns]; ok {
+			return m.Share()
+		}
+		stores[ns] = cache.NewMemory()
+		return stores[ns]
+	}}
 }
 
-func TestMemoryStackFillOnce(t *testing.T) {
-	cachetest.RunStack(t, cachetest.Harness{
-		New: func(*testing.T, string) cache.Layer { return cache.NewMemory() },
-	})
+func TestMemoryConformance(t *testing.T) { cachetest.Run(t, sharedMemory()) }
+
+// Two stacks, each with a private Memory over one shared Memory: the origin is
+// loaded once, which only holds if the stack leases on the deepest layer.
+func TestMemoryStackFillOnce(t *testing.T) { cachetest.RunStack(t, sharedMemory()) }
+
+func TestRemoteWriteEvictsUpperTiers(t *testing.T) {
+	ctx := context.Background()
+	shared := cache.NewMemory()
+	build := func(bottom *cache.Memory) *cache.Stack {
+		return newStack(t,
+			cache.WithTier(cache.NewMemory(), time.Hour),
+			cache.WithTier(cache.NewMemory(), time.Hour),
+			cache.WithTier(bottom, time.Hour),
+		)
+	}
+	a, b := build(shared), build(shared.Share())
+	if err := a.Set(ctx, "k", []byte("one")); err != nil {
+		t.Fatal(err)
+	}
+	assertGet(t, b, "k", "one") // now in both of b's upper tiers
+	if err := a.Set(ctx, "k", []byte("two")); err != nil {
+		t.Fatal(err)
+	}
+	assertGet(t, b, "k", "two")
+	if err := a.Delete(ctx, "k"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Get(ctx, "k"); !errors.Is(err, cache.ErrMiss) {
+		t.Fatalf("b still serves a key a deleted: %v", err)
+	}
+}
+
+// Any number of layers works, including none: an origin alone still gets
+// singleflight.
+func TestAnyNumberOfTiers(t *testing.T) {
+	for tiers := range 4 {
+		t.Run(fmt.Sprintf("%d tiers", tiers), func(t *testing.T) {
+			o := newOrigin()
+			o.put("k", "v")
+			o.delay = 30 * time.Millisecond
+			opts := []cache.Option{cache.WithOrigin(o)}
+			for range tiers {
+				opts = append(opts, cache.WithTier(cache.NewMemory(), time.Minute))
+			}
+			s := newStack(t, opts...)
+			var wg sync.WaitGroup
+			for range 20 {
+				wg.Add(1)
+				go func() { defer wg.Done(); assertGet(t, s, "k", "v") }()
+			}
+			wg.Wait()
+			assertGet(t, s, "k", "v")
+			want := int32(1)
+			if tiers == 0 {
+				want = 2 // nothing holds the value between the burst and the last read
+			}
+			if n := o.loads.Load(); n != want {
+				t.Fatalf("origin loaded %d times, want %d", n, want)
+			}
+		})
+	}
+}
+
+// A lost lease stores nothing: a key deleted while its fill was loading is not
+// refilled with the value loaded before the delete.
+func TestDeleteDuringLoadIsNotOverwritten(t *testing.T) {
+	ctx := context.Background()
+	o := newOrigin()
+	o.put("k", "before")
+	o.delay = 100 * time.Millisecond
+	shared := cache.NewMemory()
+	s := newStack(t, cache.WithTier(shared, time.Hour), cache.WithOrigin(o))
+
+	done := make(chan struct{})
+	go func() { defer close(done); _, _ = s.Get(ctx, "k") }()
+	time.Sleep(30 * time.Millisecond) // the load holds the lease now
+	o.put("k", "after")
+	if err := shared.Share().Delete(ctx, "k"); err != nil { // another process invalidates
+		t.Fatal(err)
+	}
+	<-done
+	if _, err := shared.Get(ctx, "k"); !errors.Is(err, cache.ErrMiss) {
+		t.Fatalf("a fill that lost its lease was stored: %v", err)
+	}
+	assertGet(t, s, "k", "after")
 }
 
 func TestMemoryLimits(t *testing.T) {

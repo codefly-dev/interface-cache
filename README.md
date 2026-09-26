@@ -16,7 +16,7 @@ runtime. Roadmap: [codefly-dev/.github#7](https://github.com/codefly-dev/.github
 | Path | What |
 |---|---|
 | `definition/cache.json` | The published interface: kind `capability`, the `cache` configuration group (`driver`; `connection`, secret). Providers are held to it. |
-| `go/cache` | `Layer`, `Source`, `Store`, the `Stack`, the `Memory` layer, `Open` + driver registry, `Typed[T]`. Depends on nothing but `golang.org/x/sync`. |
+| `go/cache` | `Layer`, `Source`, `Store`, the `Stack` (any number of layers), `Open` + driver registry, `Typed[T]`, and `Memory`: a complete in-process backend (leases, notifications; `Share()` gives several stacks one store). Depends on nothing but `golang.org/x/sync`. |
 | `go/cache/cachetest` | Conformance suite: `Run` (Layer, Leaser, Notifier contracts) and `RunStack` (fill-once across processes). |
 | `go/sources/objectstorage` | Origin adapter over the object-storage gateway client: loads conditional on ETag. |
 
@@ -58,8 +58,8 @@ service name waits on codefly-dev/core#655.
 - **Reads** walk the layers top-down and fill the ones above a hit, never
   fresher than the entry was below.
 - **Fill-once.** Concurrent misses in a process share one load (singleflight).
-  Across processes, the first shared layer that is a `Leaser` grants one fill
-  lease; the others wait for that fill. A `Set` or `Delete` revokes an
+  Across processes, the deepest layer that is a `Leaser` (the most widely
+  shared) grants one fill lease; the others wait for that fill. A `Set` or `Delete` revokes an
   outstanding lease, so a slow load cannot store a value older than the write.
 - **Revalidation.** With `WithStaleWindow`, an expired entry that carries a
   version is reloaded conditionally; `ErrNotModified` renews it without moving

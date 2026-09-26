@@ -46,8 +46,7 @@ var (
 
 // Register makes a driver available to Open under name. Drivers live with the
 // service that provides them and call it from init, so a consumer enables one
-// with a blank import. Registering a name
-// twice panics.
+// with a blank import. Registering a name twice panics.
 func Register(name string, open Opener) {
 	registryMu.Lock()
 	defer registryMu.Unlock()

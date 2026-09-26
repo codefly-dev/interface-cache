@@ -47,9 +47,15 @@ Keep `-timeout 30m`: the first run installs the object-storage gateway.
 - **Do not mock a server.** Drivers prove themselves with `cachetest` in their
   own repository, against the server their agent runs. The object-storage
   adapter here runs against the real gateway at its pinned module version.
-- **This repo's CI does not exercise the Leaser/Notifier half of `cachetest`**:
-  no in-repo layer implements them. A change to the lease or notification
-  contract must be run against `service-redis/cache` before it merges.
+- **`Memory` is the reference backend.** It implements Layer, Leaser and
+  Notifier, and `Share()` gives several stacks one store, the way processes
+  share a server. That is how this repo tests the whole multi-layer system:
+  leases, the deepest-layer lease rule and eviction across stacks, with no
+  server. A change to the lease or notification contract must still be run
+  against `service-redis/cache` before release.
+- **The stack leases on the deepest leasing layer.** A private Memory above a
+  shared layer also grants leases, but only inside one process;
+  `TestMemoryStackFillOnce` fails if the stack leases on the top layer.
 - **The definition and the Go constants must agree.**
   `TestConstantsMatchPublishedDefinition` enforces it. Change them together, and
   bump the interface version when the contract changes. A driver fix does not
