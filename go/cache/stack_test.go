@@ -97,28 +97,27 @@ func TestAnyNumberOfTiers(t *testing.T) {
 	}
 }
 
-// A lost lease stores nothing: a key deleted while its fill was loading is not
-// refilled with the value loaded before the delete.
-func TestDeleteDuringLoadIsNotOverwritten(t *testing.T) {
+// A write that lands while a fill is loading, through another process and
+// another partition, is not undone by that fill: the fill is stored under the
+// generation the write replaced, so the next read loads the new value.
+func TestWriteDuringLoadIsNotOverwritten(t *testing.T) {
 	ctx := context.Background()
 	o := newOrigin()
 	o.put("k", "before")
 	o.delay = 100 * time.Millisecond
 	shared := cache.NewMemory()
 	s := newStack(t, cache.WithTier(shared, time.Hour), cache.WithOrigin(o))
+	other := newStack(t, cache.WithTier(shared.Share(), time.Hour), cache.WithOrigin(o))
 
 	done := make(chan struct{})
 	go func() { defer close(done); _, _ = s.Get(ctx, tenant, "k") }()
-	time.Sleep(30 * time.Millisecond) // the load holds the lease now
-	o.put("k", "after")
-	if err := shared.Share().Delete(ctx, tenant.LayerKey("k")); err != nil { // another process invalidates
+	time.Sleep(30 * time.Millisecond) // the load is running now
+	if err := other.Set(ctx, cache.NewPartition("someone-else"), "k", []byte("after")); err != nil {
 		t.Fatal(err)
 	}
 	<-done
-	if _, err := shared.Get(ctx, tenant.LayerKey("k")); !errors.Is(err, cache.ErrMiss) {
-		t.Fatalf("a fill that lost its lease was stored: %v", err)
-	}
 	assertGet(t, s, "k", "after")
+	assertGet(t, other, "k", "after")
 }
 
 func TestMemoryLimits(t *testing.T) {
@@ -234,18 +233,19 @@ func TestReadThroughFillsEveryTier(t *testing.T) {
 	if n := o.loads.Load(); n != 1 {
 		t.Fatalf("origin loaded %d times, want 1", n)
 	}
+	stored := cache.EntryKey(s, tenant, "k")
 	for name, l := range map[string]cache.Layer{"top": top, "bottom": bottom} {
-		if _, err := l.Get(ctx, tenant.LayerKey("k")); err != nil {
+		if _, err := l.Get(ctx, stored); err != nil {
 			t.Fatalf("%s tier not filled: %v", name, err)
 		}
 	}
 
 	// A value only the lower tier holds is copied up, never fresher than it
 	// was below.
-	_ = top.Delete(ctx, tenant.LayerKey("k"))
+	_ = top.Delete(ctx, stored)
 	assertGet(t, s, "k", "v")
-	below, _ := bottom.Get(ctx, tenant.LayerKey("k"))
-	above, err := top.Get(ctx, tenant.LayerKey("k"))
+	below, _ := bottom.Get(ctx, stored)
+	above, err := top.Get(ctx, stored)
 	if err != nil {
 		t.Fatalf("top tier not refilled from bottom: %v", err)
 	}
@@ -589,16 +589,23 @@ func TestWriteAroundOverStore(t *testing.T) {
 	top, bottom := cache.NewMemory(), cache.NewMemory()
 	s := newStack(t, cache.WithTier(top, time.Minute), cache.WithTier(bottom, time.Minute), cache.WithOrigin(o),
 		cache.WithWritePolicy(cache.WriteThrough))
-	granted := cache.NewPartition(tenant.Key(), cache.WriteAround())
+	granted := cache.NewPartition("tenant", cache.WriteAround())
+	assertStoresNoCopy := func(what string) {
+		t.Helper()
+		stored := cache.EntryKey(s, tenant, "k")
+		for name, l := range map[string]*cache.Memory{"top": top, "bottom": bottom} {
+			if e, err := l.Get(ctx, stored); !errors.Is(err, cache.ErrMiss) {
+				t.Fatalf("a write-around %s stored %q in the %s tier", what, e.Value, name)
+			}
+		}
+	}
 
 	assertGet(t, s, "k", "old")
 	if err := s.Set(ctx, granted, "k", []byte("new")); err != nil {
 		t.Fatal(err)
 	}
-	if top.Len() != 0 || bottom.Len() != 0 {
-		t.Fatalf("a write-around write left %d and %d entries in the tiers, want none", top.Len(), bottom.Len())
-	}
-	assertGet(t, s, "k", "new") // the partition's stale copy was dropped
+	assertStoresNoCopy("write")
+	assertGet(t, s, "k", "new") // the partition's stale copy is no longer read
 
 	o.delay = 30 * time.Millisecond
 	before := o.loads.Load()
@@ -619,28 +626,8 @@ func TestWriteAroundOverStore(t *testing.T) {
 	if err := s.Delete(ctx, granted, "k"); err != nil {
 		t.Fatal(err)
 	}
-	if top.Len() != 0 || bottom.Len() != 0 {
-		t.Fatalf("a write-around delete left entries in the tiers")
-	}
+	assertStoresNoCopy("delete")
 	if _, err := s.Get(ctx, tenant, "k"); !errors.Is(err, cache.ErrNotFound) {
 		t.Fatalf("Get after a write-around Delete = %v, want ErrNotFound", err)
-	}
-}
-
-func TestPartitionValue(t *testing.T) {
-	if got := cache.NewPartition("tenant").LayerKey("k"); got != "p6:tenant:k" {
-		t.Fatalf("partitioned layer key = %q", got)
-	}
-	if got := cache.NewPartition("tenant", cache.WriteAround()).LayerKey("k"); got != "p6:tenant:k" {
-		t.Fatalf("write-around changed the layer key: %q", got)
-	}
-	if got := cache.Global().LayerKey("k"); got != "g:k" {
-		t.Fatalf("global layer key = %q", got)
-	}
-	if got := (cache.Partition{}).LayerKey("k"); got != "" {
-		t.Fatalf("the zero partition has layer key %q, want none", got)
-	}
-	if cache.NewPartition("a") != cache.NewPartition("a") || cache.NewPartition("a") == cache.NewPartition("a", cache.WriteAround()) {
-		t.Fatal("partitions do not compare by key and write-around")
 	}
 }

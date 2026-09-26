@@ -62,13 +62,19 @@ Keep `-timeout 30m`: the first run installs the object-storage gateway.
   bump the interface version.
 - **The gateway version in `go/sources/objectstorage/go.mod` follows
   `service-object-storage` releases.** Move it with them.
-- **Partitioning lives in the Stack, never in a driver.** `Stack.scope` is the
-  one place a `Partition` becomes a layer key; the singleflight key, leases,
-  negative entries and notifications all follow from it. Do not add a partition
-  to `Layer`, `Leaser` or `Notifier`, and never give a Stack operation a default
-  partition: without one it fails closed. `RunStack`'s partition cases, run by
-  `TestMemoryStackFillOnce` here and by every driver's suite, hold it; a change
-  to the stack's keying must still be run against `service-redis/cache`.
+- **Partitioning lives in the Stack, never in a driver.** `Partition.layerKey`
+  and `Partition.entryKey` are the only places a partition becomes a layer key;
+  the singleflight key, leases, negative entries and notifications all follow
+  from it. Do not add a partition to `Layer`, `Leaser` or `Notifier`, and never
+  give a Stack operation a default partition: without one it fails closed.
+  `RunStack`'s partition cases, run by `TestMemoryStackFillOnce` here and by
+  every driver's suite, hold it; a change to the stack's keying must still be
+  run against `service-redis/cache`.
+- **A write reaches every partition through the key's generation.** Read the
+  generation before loading the origin, store every copy under it, and replace
+  it on every write; never mint one over an existing generation (the lease
+  holder re-reads before it fills). `WritesReachEveryPartition` fails without
+  each of these.
 - **The cache stores data, never decisions.** Nothing here authorizes a read,
   and docs or examples must not suggest a partition does.
 - **A lease is revoked by any write.** `Set`, `Delete` and expiry must all make

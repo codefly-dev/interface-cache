@@ -64,11 +64,14 @@ A cache hit proves only that someone in the same partition loaded the value; it
 says nothing about whether this caller may read it. Partitioning prevents
 cross-viewer *data* leaks; it does not replace the check.
 
-The `objectstorage` source is the clearest case: it loads with the gateway
-credential on its client's connection, a service credential, not the caller's.
-The gateway therefore answers for the service, and a stack over it will return
-any object to whoever asks with a valid partition. It is only safe behind the
-consumer's own check of the caller against the object.
+The `objectstorage` source is the clearest case. It loads with whatever
+credential its gateway client is configured with. For a shared stack that must
+be the consumer's service credential: the gateway then answers for the service,
+and a stack over it returns any object to whoever asks with a valid partition,
+so it is only safe behind the consumer's own check of the caller against the
+object. A client whose per-call credentials come from the caller's context
+would, through a shared load, authorize every caller in the partition as the
+one whose request started the load (next paragraph).
 
 Every `Stack` operation takes a `Partition`:
 
@@ -79,11 +82,25 @@ Every `Stack` operation takes a `Partition`:
   session or task ids: they carry no authorization meaning and would make every
   read a miss. codefly's SDK derives the key from a verified Work Context; this
   module never interprets identity and depends on neither core nor the SDK.
-- The stack prefixes every key with the partition in every layer
-  (`Partition.LayerKey` gives the stored key). Values, fill leases, negative
-  entries, in-process fill-once and invalidation notices are all scoped by it:
-  two partitions never observe each other. Drivers are unchanged; they never see
-  a partition.
+- **An origin that reads the caller's identity makes the data vary by viewer.**
+  A load is shared by every caller in the partition and runs with the context
+  of the one that started it. If the origin authorizes or filters with that
+  context (per-call credentials, row-level security), every caller in the
+  partition receives what that one caller was allowed to see, errors and
+  "not found" included. Such an origin needs the authorization-view digest in
+  the key, not the tenant alone.
+- The stack prefixes every key with the partition in every layer. Values, fill
+  leases, negative entries, in-process fill-once and invalidation notices are
+  all scoped by it: two partitions never observe each other. Drivers are
+  unchanged; they never see a partition.
+- **A write reaches every partition.** Over an origin, each key has a
+  *generation*, a random token held in the layers under a key shared by all
+  partitions, and every partition's copy is stored under the current one. `Set`
+  and `Delete` write the origin, then they and `Invalidate` replace the
+  generation, so no partition reads a copy made before the write, and a
+  load that was running during it is stored where no read looks. A stack with
+  no origin holds each partition's own values, and its writes touch only the
+  caller's partition.
 - **Fail closed.** `Get`, `GetEntry`, `Set`, `Delete` and `Invalidate` with the
   zero `Partition` (or an empty key) return `ErrNoPartition`. A stack that holds
   data every caller may read opts out with `WithGlobal()` and passes
@@ -93,12 +110,19 @@ Every `Stack` operation takes a `Partition`:
   under an approval grant (codefly-dev/core#658). Its reads go to the origin
   alone: they consult no layer, take no fill lease, share their load with no
   other caller, and store nothing, found or not found. Its writes reach the
-  origin and drop the key's copies in that partition key. Without an origin a
-  write-around `Set` stores nothing.
+  origin and replace the key's generation like any write. Without an origin a
+  write-around `Set` stores nothing and drops the partition's value.
 - **Revocation.** Because `authorization_revision` is part of the view digest,
   a bump moves callers to a fresh partition, so no entry cached before it is
   served after it. The cost: a bump makes that view's cache cold, and the old
   partition's entries sit unused until their TTL.
+- **Cost.** Each partition holds its own copy of a key, and each key over an
+  origin one generation entry per layer, so a layer holds up to one copy per
+  view in use. Size `MaxEntries` (and the server's memory) for that: a busy
+  view evicts other tenants' entries sooner than when every viewer shared one
+  copy. A read looks up the generation, then the copy: two lookups, both in
+  the in-process tier when it holds them, two round trips when only the shared
+  layer does.
 
 ## Semantics
 
@@ -107,16 +131,19 @@ Every `Stack` operation takes a `Partition`:
 - **Fill-once.** Concurrent misses for one key in one partition share one load
   in a process (singleflight).
   Across processes, the deepest layer that is a `Leaser` (the most widely
-  shared) grants one fill lease; the others wait for that fill. A `Set` or `Delete` revokes an
-  outstanding lease, so a slow load cannot store a value older than the write.
+  shared) grants one fill lease; the others wait for that fill. A load that
+  was running when a write landed is stored under the generation the write
+  replaced, so it cannot bring back a value older than the write.
 - **Revalidation.** With `WithStaleWindow`, an expired entry that carries a
   version is reloaded conditionally; `ErrNotModified` renews it without moving
   the value.
 - **Writes.** Over a `Store` origin, `Set`/`Delete` write the origin, then
-  invalidate (default) or write through. Over a read-only origin they are
-  `ErrReadOnlyOrigin`. With no origin, the stack is a plain cache.
+  replace the key's generation; `WriteThrough` also stores the new value as the
+  writer's copy. Over a read-only origin they are `ErrReadOnlyOrigin`. With no
+  origin, the stack is a plain cache.
 - **Invalidation across processes.** A `Notifier` layer (Redis) reports keys
-  other processes changed, and the stack evicts them from the layers above it.
+  other processes changed, including generations, and the stack evicts them
+  from the layers above it.
 - **Degrade.** A failing layer is skipped behind a breaker; reads fall through
   to the next layer or the origin. `Invalidate` is always attempted and reports
   failures, because a missed invalidation serves stale data.
@@ -125,25 +152,28 @@ Every `Stack` operation takes a `Partition`:
 
 ### Limits, stated
 
-- Invalidation notices may be lossy (Redis pub/sub is): a missed notice leaves
-  the key in the layers above until their own TTL. Keep in-process TTLs short
-  relative to how stale a value may be.
 - Until the breaker opens (default 5 failures), each read pays the driver's
   timeouts and retries against an unreachable server; drivers document how to
   tune them.
+- Invalidation notices may be lossy (Redis pub/sub is): a missed notice leaves
+  the key in the layers above until their own TTL. Keep in-process TTLs short
+  relative to how stale a value may be. This covers generations too: a process
+  that misses a write's notice keeps reading copies under the old generation
+  until its in-process tier drops it, at most that tier's TTL.
 - Writes that bypass the stack reach cached copies only through TTL, or through
-  an explicit `Stack.Invalidate`.
-- A write, delete or invalidation reaches the cached copies in its own
-  partition only. The stack cannot enumerate partitions, so other partitions'
-  copies of the same origin key are served until their TTL. Size TTLs for how
-  stale another viewer's copy may be, or hold viewer-independent data in a
-  `WithGlobal()` stack.
+  an explicit `Stack.Invalidate`, which reaches every partition.
+- Processes on different interface versions must not share a layer: they key
+  it differently, so neither invalidates the other's copies. Upgrade them
+  together, or point the new version at an empty keyspace.
 
 ## Versioning
 
 The interface version (`definition/cache.json`) moves only when the contract
-changes: the definition or the Go API that consumers and drivers share. A driver
-fix does not move it. Modules are tagged per path (`go/cache/vX.Y.Z`,
+changes: the definition, or the Go API consumers or drivers program against. A
+driver fix does not move it. A provider declares the interface version it
+serves, so a breaking move requires each provider to declare the new version,
+even when, as in 0.2.0, the configuration it emits is unchanged: a consumer
+that requires `^0.2` does not bind to a provider that still declares 0.1. Modules are tagged per path (`go/cache/vX.Y.Z`,
 `go/sources/objectstorage/vX.Y.Z`). `go.work` ties them together for development;
 a released module requires a tagged `go/cache`. While a contract change is
 untagged, a module that needs it builds against it with a `replace` directive,
@@ -151,7 +181,8 @@ dropped once `go/cache` is tagged. A driver pins the `go/cache` version it
 implements.
 
 0.2.0 is a breaking change: every `Stack` and `Typed` operation takes a
-`Partition`, and `RunStack` gains the partition cases. The `Layer`, `Leaser`
+`Partition`, the stack's keys in a layer change (see Limits), and `RunStack`
+gains the partition cases under a `Partitions` subtest. The `Layer`, `Leaser`
 and `Notifier` contracts are unchanged, so a driver moves by bumping its
 `go/cache` requirement; its tests that call the stack pass a partition.
 

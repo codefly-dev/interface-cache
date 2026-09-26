@@ -1,6 +1,8 @@
 package cache
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"strconv"
 )
@@ -31,6 +33,12 @@ var (
 // served after it. It never includes session or task ids, which carry no
 // authorization meaning and would make every read a miss.
 //
+// Data varies by viewer whenever the origin reads the caller's identity from
+// the context — per-caller credentials, row-level security. A shared load runs
+// with the context of the caller that started it, so every caller in the
+// partition receives what that one caller was allowed to see: such an origin
+// needs the authorization-view digest in the key.
+//
 // Partition is comparable. Its zero value is no partition, which every
 // operation refuses.
 type Partition struct {
@@ -46,7 +54,7 @@ type PartitionOption func(*Partition)
 // nothing, in any layer: work done under an approval grant, whose result must
 // not be served to callers who never held the grant. Such a read neither
 // consults the layers nor takes a fill lease; its writes still reach the
-// origin and drop the key's cached copies in the partition.
+// origin and invalidate the key as any write does.
 func WriteAround() PartitionOption { return func(p *Partition) { p.writeAround = true } }
 
 // NewPartition returns the partition for key. An empty key yields a partition
@@ -63,32 +71,43 @@ func NewPartition(key string, opts ...PartitionOption) Partition {
 // vary by viewer. It is refused by every other stack.
 func Global() Partition { return Partition{global: true} }
 
-// Key returns the partition's opaque key; empty for Global and the zero value.
-func (p Partition) Key() string { return p.key }
-
-// IsWriteAround reports whether reads in p store nothing.
-func (p Partition) IsWriteAround() bool { return p.writeAround }
-
-// IsGlobal reports whether p is Global.
-func (p Partition) IsGlobal() bool { return p.global }
-
-// LayerKey returns the key the stack reads and writes in its layers for key
-// under p, and "" for a partition every stack refuses. Operators use it to
-// find an entry in a shared layer; conformance tests use it to check what the
-// stack stored. The encoding is part of the interface version:
+// The keys a stack uses in its layers. The leading byte names the family, and
+// every variable part before the caller's key is length-prefixed, so no
+// partition, generation and key can spell another's layer key.
 //
-//	partitioned  "p" + len(partition key) + ":" + partition key + ":" + key
-//	global       "g:" + key
+//	value, no origin      "p" len ":" partition ":" key    |  "g:" key
+//	copy of an origin key "P" len ":" partition ":" len ":" generation ":" key
+//	                      "G" len ":" generation ":" key
+//	generation            "i:" key
 //
-// The length makes it unambiguous, so no pair of partition and key can reach
-// another's entry. Write-around does not change the layer key.
-func (p Partition) LayerKey(key string) string {
-	switch {
-	case p.global:
+// Write-around does not change the key.
+
+// layerKey is where a stack without an origin stores key in p.
+func (p Partition) layerKey(key string) string {
+	if p.global {
 		return "g:" + key
-	case p.key == "":
-		return ""
-	default:
-		return "p" + strconv.Itoa(len(p.key)) + ":" + p.key + ":" + key
 	}
+	return "p" + strconv.Itoa(len(p.key)) + ":" + p.key + ":" + key
+}
+
+// entryKey is where a stack with an origin stores its copy of key in p, under
+// the key's current generation.
+func (p Partition) entryKey(generation, key string) string {
+	g := strconv.Itoa(len(generation)) + ":" + generation + ":" + key
+	if p.global {
+		return "G" + g
+	}
+	return "P" + strconv.Itoa(len(p.key)) + ":" + p.key + ":" + g
+}
+
+// generationKey is where the layers hold key's generation. It is shared by
+// every partition: a write replaces it, which orphans every partition's copy.
+func generationKey(key string) string { return "i:" + key }
+
+// newGeneration returns a token no earlier generation of any key used, so an
+// expired or evicted generation is replaced by one no stored copy is under.
+func newGeneration() string {
+	var b [12]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
 }

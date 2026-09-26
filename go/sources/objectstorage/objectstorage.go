@@ -6,13 +6,15 @@
 // The gateway knows nothing about caching; this adapter only uses its
 // ordinary, versioned reads and writes.
 //
-// The source loads with the credential on its client's connection — the
-// consumer's service credential, not the caller's — so the gateway answers for
-// the service, never for the caller. A stack over it is only safe behind the
-// consumer's own authorization check of the caller against the object, run
-// before every read: the cache stores data, never decisions. Partitioning the
-// stack keeps one viewer's copy from reaching another; it does not decide who
-// may read.
+// The source loads with whatever credential its client is configured with.
+// Under a shared stack that must be the consumer's service credential, so the
+// gateway answers for the service, never for the caller: a stack over it is
+// only safe behind the consumer's own authorization check of the caller
+// against the object, run before every read. The cache stores data, never
+// decisions. A client whose per-call credentials come from the caller's
+// context would authorize every caller sharing a load as the one who started
+// it. Partitioning the stack keeps one viewer's copy from reaching another; it
+// does not decide who may read.
 package objectstorage
 
 import (
