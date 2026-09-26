@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [ go/cache, go/sources/objectstorage ]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ matrix.module }}
+    env:
+      # Each module is checked the way a consumer resolves it, not through the
+      # development workspace.
+      GOWORK: "off"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # setup-go's cache corrupts the downloaded toolchain module on restore;
+      # the fleet's shared Go workflow disables it for the same reason.
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: ${{ matrix.module }}/go.mod
+          cache: false
+
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go mod tidy -diff
+      - run: go test -race -count=1 -v -timeout 30m ./...
