@@ -412,16 +412,28 @@ func runResyncFlushes(t *testing.T, h Harness) {
 	origin := newViewerOrigin()
 	p := newProcess(t, h, ns, cache.WithOrigin(origin))
 	plain := newProcess(t, h, ns)
-	for _, viewer := range []string{"u", "v"} {
+	viewers := []string{"u", "v"}
+	for _, viewer := range viewers {
 		assertGet(t, p.stack, viewer, partitionOf(viewer), "k", viewValue("k", viewer))
 		if err := plain.stack.Set(ctx, partitionOf(viewer), "k", []byte(viewer)); err != nil {
 			t.Fatal(err)
 		}
 	}
+	// A Notifier may echo a stack's own writes, and asynchronously: an echo
+	// that lands after the write evicts the copy that write just stored. Only
+	// once every notice of the writes above has been delivered does a copy
+	// stay put, so wait for that, then fill the in-process tiers by reading,
+	// which notifies no one.
+	drainNotices(t, h, ns, p, plain)
 	for _, x := range []process{p, plain} {
+		for _, viewer := range viewers {
+			_, _ = x.stack.Get(asViewer(viewer), partitionOf(viewer), "k")
+		}
 		if x.top.Len() == 0 {
 			t.Fatal("the stack cached nothing in its in-process tier")
 		}
+	}
+	for _, x := range []process{p, plain} {
 		h.Interrupt(t, x.raw)
 	}
 	for _, x := range []process{p, plain} {
@@ -794,6 +806,28 @@ func newProcess(t *testing.T, h Harness, namespace string, opts ...cache.Option)
 	return p
 }
 
+// drainNotices waits until every notice of the writes made so far in
+// namespace has reached each process's stack. A server delivers its notices in
+// order, so once a stack has heard markers written after them, it has heard
+// them. The markers span many keys, so that on a server of several shards
+// every shard's stream is drained too.
+func drainNotices(t *testing.T, h Harness, namespace string, processes ...process) {
+	t.Helper()
+	writer := h.New(t, namespace)
+	if _, ok := writer.(cache.Notifier); !ok {
+		return
+	}
+	markers := make([]string, 64)
+	for i := range markers {
+		markers[i] = fmt.Sprintf("drain-%s-%d", Namespace(t), i)
+		mustSet(t, writer, markers[i], cache.Entry{Value: []byte("marker")}, time.Minute)
+	}
+	for _, x := range processes {
+		eventually(t, 10*time.Second, func() bool { return x.shared.heardAll(markers) },
+			"the stack never heard notices written after the ones it is waiting for")
+	}
+}
+
 // settle waits until every invalidation notice a's layer has published so far
 // has reached b. Notices from one client arrive in order, so once b has
 // heard a later one, it has heard the earlier ones.
@@ -816,9 +850,34 @@ func settle(t *testing.T, a, b process) {
 // recorder counts the calls a stack makes on the layer it wraps, and keeps
 // the key of the last Set.
 type recorder struct {
-	mu  sync.Mutex
-	n   int
-	set string
+	mu    sync.Mutex
+	n     int
+	set   string
+	heard map[string]bool // keys the layer's notices delivered to the stack
+}
+
+// notified wraps a stack's notice callback so the recorder sees each key.
+func (r *recorder) notified(fn func(string)) func(string) {
+	return func(key string) {
+		r.mu.Lock()
+		if r.heard == nil {
+			r.heard = map[string]bool{}
+		}
+		r.heard[key] = true
+		r.mu.Unlock()
+		fn(key)
+	}
+}
+
+func (r *recorder) heardAll(keys []string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, key := range keys {
+		if !r.heard[key] {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *recorder) called() {
@@ -913,13 +972,13 @@ func (x recordedLeaser) Release(ctx context.Context, lease cache.Lease) error {
 type recordedNotifier struct{ recordedLayer }
 
 func (x recordedNotifier) Subscribe(ctx context.Context, fn func(key string)) (func(), error) {
-	return x.layer.(cache.Notifier).Subscribe(ctx, fn)
+	return x.layer.(cache.Notifier).Subscribe(ctx, x.r.notified(fn))
 }
 
 type recordedLeaserNotifier struct{ recordedLeaser }
 
 func (x recordedLeaserNotifier) Subscribe(ctx context.Context, fn func(key string)) (func(), error) {
-	return x.layer.(cache.Notifier).Subscribe(ctx, fn)
+	return x.layer.(cache.Notifier).Subscribe(ctx, x.r.notified(fn))
 }
 
 type recordedResyncer struct{ recordedNotifier }
