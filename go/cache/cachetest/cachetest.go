@@ -10,6 +10,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -25,6 +27,18 @@ type Harness struct {
 	// must return independent clients that see the same data, the way two
 	// processes would; different namespaces must not see each other's keys.
 	New func(t *testing.T, namespace string) cache.Layer
+
+	// ExternalWrite, when set, changes key in namespace straight in the
+	// backend, bypassing the driver — the way another program, an operator or
+	// the server itself would (for Redis: a plain SET or DEL). The value
+	// written does not matter. With it, the suite checks that a Notifier
+	// reports changes by any writer, not only those made through a driver.
+	ExternalWrite func(t *testing.T, namespace, key string)
+
+	// Interrupt, required when the layer is a cache.Resyncer, breaks l's
+	// notification stream the way a dropped connection or a server restart
+	// would, so the suite can check that the gap is signalled.
+	Interrupt func(t *testing.T, l cache.Layer)
 }
 
 // Namespace returns a namespace no other test uses.
@@ -38,7 +52,9 @@ func Namespace(t *testing.T) string {
 }
 
 // Run checks the Layer contract, plus the Leaser and Notifier contracts when
-// the layer implements them.
+// the layer implements them. A Notifier must report other clients' writes, and
+// with ExternalWrite set, writes that bypass the driver; a Resyncer must signal
+// a gap after Interrupt and keep reporting after it.
 func Run(t *testing.T, h Harness) {
 	t.Run("Layer", func(t *testing.T) { runLayer(t, h) })
 	if _, ok := h.New(t, Namespace(t)).(cache.Leaser); ok {
@@ -254,105 +270,820 @@ func runLeaser(t *testing.T, h Harness) {
 
 func runNotifier(t *testing.T, h Harness) {
 	ctx := context.Background()
-	ns := Namespace(t)
-	a, b := h.New(t, ns).(cache.Notifier), h.New(t, ns).(cache.Notifier)
 
-	var mu sync.Mutex
-	seen := map[string][]string{}
-	record := func(who string) func(string) {
-		return func(key string) {
-			mu.Lock()
-			defer mu.Unlock()
-			seen[who] = append(seen[who], key)
+	// Every other client's write is reported. A client may also hear its own
+	// writes: the contract allows it, and the stack's eviction is idempotent.
+	t.Run("OtherClientsWrites", func(t *testing.T) {
+		ns := Namespace(t)
+		a, b := h.New(t, ns).(cache.Notifier), h.New(t, ns).(cache.Notifier)
+		heardA, heardB := subscribe(t, a), subscribe(t, b)
+
+		mustSet(t, a, "set-by-a", cache.Entry{Value: []byte("v")}, time.Minute)
+		if err := a.Delete(ctx, "deleted-by-a"); err != nil {
+			t.Fatal(err)
 		}
-	}
-	stopA, err := a.Subscribe(ctx, record("a"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer stopA()
-	stopB, err := b.Subscribe(ctx, record("b"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer stopB()
-
-	mustSet(t, a, "set-by-a", cache.Entry{Value: []byte("v")}, time.Minute)
-	if err := a.Delete(ctx, "deleted-by-a"); err != nil {
-		t.Fatal(err)
-	}
-	if err := b.Delete(ctx, "deleted-by-b"); err != nil {
-		t.Fatal(err)
-	}
-	eventually(t, 3*time.Second, func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return len(seen["b"]) >= 2 && len(seen["a"]) >= 1
-	}, "notifications never arrived")
-
-	mu.Lock()
-	defer mu.Unlock()
-	if want := []string{"set-by-a", "deleted-by-a"}; !equalStrings(seen["b"], want) {
-		t.Fatalf("b heard %v, want %v", seen["b"], want)
-	}
-	// b's delete was published after a's writes, so by the time a hears it, a
-	// would also have heard its own writes had they been echoed back.
-	if want := []string{"deleted-by-b"}; !equalStrings(seen["a"], want) {
-		t.Fatalf("a heard %v, want only other clients' writes %v", seen["a"], want)
-	}
-}
-
-// RunStack checks fill-once across processes: two stacks sharing the layer
-// under test, each with its own Memory tier, hammered with concurrent reads of
-// one missing key, reach the origin once when the layer is a Leaser, and at
-// most once per stack otherwise.
-func RunStack(t *testing.T, h Harness) {
-	ctx := context.Background()
-	ns := Namespace(t)
-	var loads atomic.Int32
-	origin := cache.SourceFunc(func(ctx context.Context, key, ifNot string) (cache.Entry, error) {
-		loads.Add(1)
-		time.Sleep(100 * time.Millisecond) // long enough for every reader to pile up
-		return cache.Entry{Value: []byte("from origin"), Version: "1"}, nil
+		if err := b.Delete(ctx, "deleted-by-b"); err != nil {
+			t.Fatal(err)
+		}
+		heardB.wait(t, "set-by-a", "deleted-by-a")
+		heardA.wait(t, "deleted-by-b")
 	})
-	newStack := func() *cache.Stack {
-		s, err := cache.New(ctx,
-			cache.WithTier(cache.NewMemory(), time.Minute),
-			cache.WithTier(h.New(t, ns), time.Minute),
-			cache.WithOrigin(origin),
-		)
+
+	t.Run("ExternalWrites", func(t *testing.T) {
+		if h.ExternalWrite == nil {
+			t.Skip("the harness has no ExternalWrite")
+		}
+		ns := Namespace(t)
+		heard := subscribe(t, h.New(t, ns).(cache.Notifier))
+		h.ExternalWrite(t, ns, "written-externally")
+		heard.wait(t, "written-externally")
+	})
+
+	t.Run("Resync", func(t *testing.T) {
+		ns := Namespace(t)
+		l, ok := h.New(t, ns).(cache.Resyncer)
+		if !ok {
+			t.Skip("the layer is not a Resyncer: it must never lose a notice")
+		}
+		if h.Interrupt == nil {
+			t.Fatal("the layer is a Resyncer, so the harness must set Interrupt to prove it signals a gap")
+		}
+		var resyncs atomic.Int32
+		stop, err := l.SubscribeResync(ctx, func() { resyncs.Add(1) })
 		if err != nil {
 			t.Fatal(err)
 		}
-		t.Cleanup(s.Close)
-		return s
+		defer stop()
+		heard := subscribe(t, l)
+		h.Interrupt(t, l)
+		eventually(t, 10*time.Second, func() bool { return resyncs.Load() > 0 }, "an interrupted Resyncer never signalled the gap")
+		// Notices flow again after the signal.
+		other := h.New(t, ns)
+		mustSet(t, other, "after-the-gap", cache.Entry{Value: []byte("v")}, time.Minute)
+		heard.wait(t, "after-the-gap")
+	})
+}
+
+// heard collects the keys a Notifier reports.
+type heard struct {
+	mu   sync.Mutex
+	keys map[string]bool
+}
+
+func subscribe(t *testing.T, n cache.Notifier) *heard {
+	t.Helper()
+	h := &heard{keys: map[string]bool{}}
+	stop, err := n.Subscribe(context.Background(), func(key string) {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		h.keys[key] = true
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	stacks := []*cache.Stack{newStack(), newStack()}
+	t.Cleanup(stop)
+	return h
+}
+
+func (h *heard) wait(t *testing.T, keys ...string) {
+	t.Helper()
+	eventually(t, 3*time.Second, func() bool {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		for _, key := range keys {
+			if !h.keys[key] {
+				return false
+			}
+		}
+		return true
+	}, fmt.Sprintf("the Notifier never reported all of %q", keys))
+}
+
+// RunStack checks the stack over the layer under test, shared by several
+// stacks the way processes share a server, each with its own Memory tier
+// above it. Concurrent reads of one missing key reach the origin once per
+// partition when the layer is a Leaser, and at most once per stack otherwise.
+// Then, in Partitions: two partitions never observe each other's values, fill
+// leases, negative entries or invalidation notices; a write through any
+// partition reaches every partition's copy; an operation without a partition
+// fails and touches nothing; a write-around partition stores nothing; an
+// authorization revision bump, which changes the partition, misses.
+//
+// When the layer is a Notifier and ExternalWrite is set, a write that bypasses
+// the driver evicts the stack's in-process copy; when it is a Resyncer, a gap
+// flushes the stack's in-process tier.
+func RunStack(t *testing.T, h Harness) {
+	runFillOnce(t, h)
+	t.Run("Partitions", func(t *testing.T) { runPartitions(t, h) })
+	t.Run("ExternalWriteEvictsMemory", func(t *testing.T) { runExternalWriteEvicts(t, h) })
+	t.Run("ResyncFlushesMemory", func(t *testing.T) { runResyncFlushes(t, h) })
+}
+
+func runExternalWriteEvicts(t *testing.T, h Harness) {
+	ns := Namespace(t)
+	if _, ok := h.New(t, ns).(cache.Notifier); !ok || h.ExternalWrite == nil {
+		t.Skip("needs a Notifier and the harness's ExternalWrite")
+	}
+	ctx := context.Background()
+	p := newProcess(t, h, ns)
+	u := partitionOf("u")
+	if err := p.stack.Set(ctx, u, "k", []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	stored := p.shared.lastSet() // the key the stack wrote in the shared layer
+	assertGet(t, p.stack, "", u, "k", "v")
+	h.ExternalWrite(t, ns, stored)
+	eventually(t, 3*time.Second, func() bool {
+		p.shared.reset()
+		_, _ = p.stack.Get(ctx, u, "k")
+		return p.shared.calls() > 0
+	}, "a write that bypassed the driver never evicted the stack's in-process copy")
+}
+
+func runResyncFlushes(t *testing.T, h Harness) {
+	ns := Namespace(t)
+	if _, ok := h.New(t, ns).(cache.Resyncer); !ok {
+		t.Skip("the layer is not a Resyncer")
+	}
+	if h.Interrupt == nil {
+		t.Fatal("the layer is a Resyncer, so the harness must set Interrupt")
+	}
+	ctx := context.Background()
+	origin := newViewerOrigin()
+	p := newProcess(t, h, ns, cache.WithOrigin(origin))
+	plain := newProcess(t, h, ns)
+	for _, viewer := range []string{"u", "v"} {
+		assertGet(t, p.stack, viewer, partitionOf(viewer), "k", viewValue("k", viewer))
+		if err := plain.stack.Set(ctx, partitionOf(viewer), "k", []byte(viewer)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, x := range []process{p, plain} {
+		if x.top.Len() == 0 {
+			t.Fatal("the stack cached nothing in its in-process tier")
+		}
+		h.Interrupt(t, x.raw)
+	}
+	for _, x := range []process{p, plain} {
+		eventually(t, 10*time.Second, func() bool { return x.top.Len() == 0 },
+			"a resync left copies (of some partition or generation) in the in-process tier")
+	}
+}
+
+func runFillOnce(t *testing.T, h Harness) {
+	ns := Namespace(t)
+	origin := newViewerOrigin()
+	origin.delay = 100 * time.Millisecond // long enough for every reader to pile up
+	stacks := []*cache.Stack{
+		newProcess(t, h, ns, cache.WithOrigin(origin)).stack,
+		newProcess(t, h, ns, cache.WithOrigin(origin)).stack,
+	}
+	viewers := []string{"u", "v"}
 
 	var wg sync.WaitGroup
 	for i := range 64 {
-		s := stacks[i%2]
+		s, viewer := stacks[i%2], viewers[(i/2)%2]
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			v, err := s.Get(ctx, "k")
+			v, err := s.Get(asViewer(viewer), partitionOf(viewer), "k")
 			if err != nil {
 				t.Error(err)
 				return
 			}
-			if string(v) != "from origin" {
-				t.Errorf("Get = %q", v)
+			if want := viewValue("k", viewer); string(v) != want {
+				t.Errorf("%s read %q, want %q", viewer, v, want)
 			}
 		}()
 	}
 	wg.Wait()
 
-	want := int32(2)
+	want := 2
 	if _, ok := h.New(t, ns).(cache.Leaser); ok {
 		want = 1
 	}
-	if n := loads.Load(); n > want || n == 0 {
-		t.Fatalf("origin loaded %d times, want %d at most", n, want)
+	for _, viewer := range viewers {
+		if n := origin.loadsBy(viewer); n > want || n == 0 {
+			// Errorf, not Fatalf: the partition cases still run and report.
+			t.Errorf("origin loaded %d times for %s, want %d at most", n, viewer, want)
+		}
+	}
+}
+
+func runPartitions(t *testing.T, h Harness) {
+	ctx := context.Background()
+	u, v := partitionOf("u"), partitionOf("v")
+
+	t.Run("ValuesIsolated", func(t *testing.T) {
+		ns := Namespace(t)
+		origin := newViewerOrigin()
+		a := newProcess(t, h, ns, cache.WithOrigin(origin))
+		b := newProcess(t, h, ns, cache.WithOrigin(origin))
+		assertGet(t, a.stack, "u", u, "k", viewValue("k", "u"))
+		assertGet(t, a.stack, "v", v, "k", viewValue("k", "v"))
+		assertGet(t, b.stack, "v", v, "k", viewValue("k", "v"))
+		assertGet(t, b.stack, "u", u, "k", viewValue("k", "u"))
+		for _, viewer := range []string{"u", "v"} {
+			if n := origin.loadsBy(viewer); n != 1 {
+				t.Fatalf("origin loaded %d times for %s, want 1: each partition fills once, and only for itself", n, viewer)
+			}
+		}
+
+		// Without an origin, a value set in one partition is a miss in
+		// every other, in either process.
+		c := newProcess(t, h, ns)
+		d := newProcess(t, h, ns)
+		if err := c.stack.Set(ctx, u, "plain", []byte("u's")); err != nil {
+			t.Fatal(err)
+		}
+		for _, s := range []*cache.Stack{c.stack, d.stack} {
+			if got, err := s.Get(ctx, v, "plain"); !errors.Is(err, cache.ErrMiss) {
+				t.Fatalf("another partition read %q, %v; want ErrMiss", got, err)
+			}
+		}
+		assertGet(t, d.stack, "", u, "plain", "u's")
+
+		// The layer key is unambiguous: no split of partition key and key
+		// reaches another's entry.
+		if err := c.stack.Set(ctx, cache.NewPartition("x"), "y:z", []byte("x's")); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := d.stack.Get(ctx, cache.NewPartition("x:y"), "z"); !errors.Is(err, cache.ErrMiss) {
+			t.Fatalf("partition %q read partition %q's entry: %q, %v", "x:y", "x", got, err)
+		}
+	})
+
+	t.Run("FillOnceDoesNotCrossPartitions", func(t *testing.T) {
+		ns := Namespace(t)
+		origin := newViewerOrigin()
+		release := origin.hold("u")
+		defer release()
+		// A lease long enough that waiting on another partition's fill would
+		// outlast the deadline below.
+		a := newProcess(t, h, ns, cache.WithOrigin(origin), cache.WithLeaseTTL(30*time.Second))
+		b := newProcess(t, h, ns, cache.WithOrigin(origin), cache.WithLeaseTTL(30*time.Second))
+
+		done := make(chan error, 1)
+		go func() {
+			got, err := a.stack.Get(asViewer("u"), u, "k")
+			if err == nil && string(got) != viewValue("k", "u") {
+				err = fmt.Errorf("u read %q", got)
+			}
+			done <- err
+		}()
+		eventually(t, 3*time.Second, func() bool { return origin.loadsBy("u") == 1 }, "u's load never started")
+
+		// u's load holds the in-process flight in a and the lease on the
+		// shared layer. Readers in other partitions, in the same process and
+		// in another, load for themselves instead of waiting for it.
+		for _, r := range []struct {
+			s      *cache.Stack
+			viewer string
+		}{{a.stack, "v"}, {b.stack, "w"}} {
+			rctx, cancel := context.WithTimeout(asViewer(r.viewer), 3*time.Second)
+			got, err := r.s.Get(rctx, partitionOf(r.viewer), "k")
+			cancel()
+			if err != nil {
+				t.Fatalf("%s waited on another partition's fill: %v", r.viewer, err)
+			}
+			if want := viewValue("k", r.viewer); string(got) != want {
+				t.Fatalf("%s read %q, want %q", r.viewer, got, want)
+			}
+		}
+		release()
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("NegativeEntriesIsolated", func(t *testing.T) {
+		ns := Namespace(t)
+		origin := newViewerOrigin()
+		origin.hide("u")
+		a := newProcess(t, h, ns, cache.WithOrigin(origin), cache.WithNegativeTTL(time.Minute))
+		b := newProcess(t, h, ns, cache.WithOrigin(origin), cache.WithNegativeTTL(time.Minute))
+
+		// u's "not found" does not mask v's value...
+		if got, err := a.stack.Get(asViewer("u"), u, "k"); !errors.Is(err, cache.ErrNotFound) {
+			t.Fatalf("u read %q, %v; want ErrNotFound", got, err)
+		}
+		assertGet(t, a.stack, "v", v, "k", viewValue("k", "v"))
+		assertGet(t, b.stack, "v", v, "k", viewValue("k", "v"))
+		// ...and v's value does not answer for u.
+		assertGet(t, b.stack, "v", v, "k2", viewValue("k2", "v"))
+		for _, s := range []*cache.Stack{a.stack, b.stack} {
+			if got, err := s.Get(asViewer("u"), u, "k2"); !errors.Is(err, cache.ErrNotFound) {
+				t.Fatalf("u read %q, %v; want ErrNotFound", got, err)
+			}
+		}
+	})
+
+	t.Run("NotificationsIsolated", func(t *testing.T) {
+		ns := Namespace(t)
+		if _, ok := h.New(t, ns).(cache.Notifier); !ok {
+			t.Skip("the layer is not a Notifier")
+		}
+		a, b := newProcess(t, h, ns), newProcess(t, h, ns)
+		for p, value := range map[cache.Partition]string{u: "u1", v: "v1"} {
+			if err := a.stack.Set(ctx, p, "k", []byte(value)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// Those writes' notices must reach b before b caches the values, or a
+		// late one evicts a copy this test then expects to find.
+		settle(t, a, b)
+		for p, value := range map[cache.Partition]string{u: "u1", v: "v1"} {
+			assertGet(t, b.stack, "", p, "k", value) // now in b's Memory tier
+		}
+		if err := a.stack.Set(ctx, u, "k", []byte("u2")); err != nil {
+			t.Fatal(err)
+		}
+		eventually(t, 3*time.Second, func() bool {
+			got, err := b.stack.Get(ctx, u, "k")
+			return err == nil && string(got) == "u2"
+		}, "u's write never evicted u's copy in the other process")
+		b.shared.reset()
+		assertGet(t, b.stack, "", v, "k", "v1")
+		if n := b.shared.calls(); n != 0 {
+			t.Fatalf("u's write evicted v's copy in the other process: reading it reached the shared layer %d times", n)
+		}
+	})
+
+	t.Run("WritesReachEveryPartition", func(t *testing.T) {
+		ns := Namespace(t)
+		origin := newViewerOrigin()
+		a := newProcess(t, h, ns, cache.WithOrigin(origin), cache.WithNegativeTTL(time.Minute))
+		b := newProcess(t, h, ns, cache.WithOrigin(origin), cache.WithNegativeTTL(time.Minute))
+		_, notifies := h.New(t, ns).(cache.Notifier)
+		// The writing process sees a write at once. Another sees it once the
+		// notice arrives; without notices its Memory tier keeps the old
+		// generation until its TTL, as the README states.
+		expect := func(writer, other process, what string, want func(viewer string) (string, error)) {
+			t.Helper()
+			processes := []process{writer}
+			if notifies {
+				processes = append(processes, other)
+			}
+			for _, pr := range processes {
+				for _, viewer := range []string{"u", "v"} {
+					wantValue, wantErr := want(viewer)
+					eventually(t, 3*time.Second, func() bool {
+						got, err := pr.stack.Get(asViewer(viewer), partitionOf(viewer), "k")
+						if wantErr != nil {
+							return errors.Is(err, wantErr)
+						}
+						return err == nil && string(got) == wantValue
+					}, what+": "+viewer+" still reads a copy made before it")
+				}
+			}
+		}
+		for _, pr := range []process{a, b} {
+			for _, viewer := range []string{"u", "v"} {
+				assertGet(t, pr.stack, viewer, partitionOf(viewer), "k", viewValue("k", viewer))
+			}
+		}
+
+		if err := a.stack.Set(asViewer("u"), u, "k", []byte("new")); err != nil {
+			t.Fatal(err)
+		}
+		expect(a, b, "a write in u", func(viewer string) (string, error) { return viewValue("new", viewer), nil })
+
+		if err := a.stack.Delete(asViewer("v"), v, "k"); err != nil {
+			t.Fatal(err)
+		}
+		expect(a, b, "a delete in v", func(string) (string, error) { return "", cache.ErrNotFound })
+
+		// A write the origin received some other way, then invalidated
+		// through one partition, including over a cached "not found".
+		origin.put("k", "out of band")
+		if err := b.stack.Invalidate(ctx, u, "k"); err != nil {
+			t.Fatal(err)
+		}
+		expect(b, a, "an invalidation in u", func(viewer string) (string, error) { return viewValue("out of band", viewer), nil })
+	})
+
+	t.Run("RequiresPartition", func(t *testing.T) {
+		ns := Namespace(t)
+		origin := newViewerOrigin()
+		refused := map[string]struct {
+			p    cache.Partition
+			want error
+		}{
+			"none":                    {cache.Partition{}, cache.ErrNoPartition},
+			"empty key":               {cache.NewPartition(""), cache.ErrNoPartition},
+			"empty write-around key":  {cache.NewPartition("", cache.WriteAround()), cache.ErrNoPartition},
+			"global on a partitioned": {cache.Global(), cache.ErrWrongPartition},
+		}
+		pr := newProcess(t, h, ns, cache.WithOrigin(origin))
+		plain := newProcess(t, h, ns)
+		for name, c := range refused {
+			assertRefused(t, name, pr.stack, c.p, c.want)
+			assertRefused(t, name, plain.stack, c.p, c.want)
+		}
+		if n := origin.loadsBy(""); n != 0 {
+			t.Fatalf("a refused operation reached the origin %d times", n)
+		}
+		for _, x := range []process{pr, plain} {
+			if n := x.shared.calls(); n != 0 || x.top.Len() != 0 {
+				t.Fatalf("refused operations made %d calls on the shared layer and left %d entries in the Memory tier, want none", n, x.top.Len())
+			}
+		}
+
+		// A global stack takes Global only, and shares no entry with the
+		// partitioned stacks over the same layer.
+		global := newProcess(t, h, ns, cache.WithGlobal()).stack
+		assertRefused(t, "none", global, cache.Partition{}, cache.ErrNoPartition)
+		assertRefused(t, "a caller's partition on a global", global, u, cache.ErrWrongPartition)
+		if err := global.Set(ctx, cache.Global(), "k", []byte("everyone's")); err != nil {
+			t.Fatal(err)
+		}
+		assertGet(t, global, "", cache.Global(), "k", "everyone's")
+		assertGet(t, pr.stack, "u", u, "k", viewValue("k", "u"))
+	})
+
+	t.Run("WriteAroundStoresNothing", func(t *testing.T) {
+		ns := Namespace(t)
+		origin := newViewerOrigin()
+		a := newProcess(t, h, ns, cache.WithOrigin(origin), cache.WithNegativeTTL(time.Minute))
+		granted := cache.NewPartition("tenant-u", cache.WriteAround())
+
+		// A write-around read does not serve what the partition's other
+		// callers cached...
+		assertGet(t, a.stack, "u", u, "k", viewValue("k", "u"))
+		origin.setSuffix("u", " under a grant")
+		assertGet(t, a.stack, "u", granted, "k", viewValue("k", "u")+" under a grant")
+		assertGet(t, a.stack, "u", u, "k", viewValue("k", "u")) // ...nor replaces it.
+
+		// ...and makes no call on any layer, found or not found: no read, no
+		// fill lease, no store.
+		b := newProcess(t, h, ns, cache.WithOrigin(origin), cache.WithNegativeTTL(time.Minute))
+		origin.hide("w")
+		before := origin.loadsBy("u")
+		for range 2 {
+			assertGet(t, b.stack, "u", granted, "fresh", viewValue("fresh", "u")+" under a grant")
+			if _, err := b.stack.Get(asViewer("w"), cache.NewPartition("tenant-w", cache.WriteAround()), "fresh"); !errors.Is(err, cache.ErrNotFound) {
+				t.Fatalf("write-around read of a missing key = %v, want ErrNotFound", err)
+			}
+		}
+		if n := origin.loadsBy("u") - before; n != 2 {
+			t.Fatalf("two write-around reads loaded the origin %d times, want 2", n)
+		}
+		if n := b.shared.calls(); n != 0 || b.top.Len() != 0 {
+			t.Fatalf("write-around reads made %d calls on the shared layer and stored %d entries in the Memory tier, want none", n, b.top.Len())
+		}
+
+		// Without an origin, its write stores nothing and drops the
+		// partition's value.
+		c := newProcess(t, h, ns)
+		if err := c.stack.Set(ctx, u, "plain", []byte("old")); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.stack.Set(ctx, cache.NewPartition("tenant-u", cache.WriteAround()), "plain", []byte("new")); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := c.stack.Get(ctx, u, "plain"); !errors.Is(err, cache.ErrMiss) {
+			t.Fatalf("after a write-around write, read %q, %v; want ErrMiss", got, err)
+		}
+	})
+
+	t.Run("RevisionBumpMisses", func(t *testing.T) {
+		ns := Namespace(t)
+		origin := newViewerOrigin()
+		a := newProcess(t, h, ns, cache.WithOrigin(origin))
+		b := newProcess(t, h, ns, cache.WithOrigin(origin))
+		before, after := cache.NewPartition("tenant-u/revision-1"), cache.NewPartition("tenant-u/revision-2")
+		assertGet(t, a.stack, "u", before, "k", viewValue("k", "u"))
+		assertGet(t, b.stack, "u", before, "k", viewValue("k", "u"))
+		if n := origin.loadsBy("u"); n != 1 {
+			t.Fatalf("origin loaded %d times before the bump, want 1", n)
+		}
+		origin.setSuffix("u", " after revocation")
+		assertGet(t, b.stack, "u", after, "k", viewValue("k", "u")+" after revocation")
+		assertGet(t, a.stack, "u", after, "k", viewValue("k", "u")+" after revocation")
+		if n := origin.loadsBy("u"); n != 2 {
+			t.Fatalf("origin loaded %d times, want 2: the bumped partition misses once, then fills", n)
+		}
+	})
+}
+
+// process is one stack over the layer under test, with its own Memory tier
+// above it, the way one process of a service holds one. shared records the
+// calls the stack makes on the layer under test.
+type process struct {
+	stack  *cache.Stack
+	top    *cache.Memory
+	shared *recorder
+	raw    cache.Layer // the layer under test, unwrapped, for Interrupt
+}
+
+func newProcess(t *testing.T, h Harness, namespace string, opts ...cache.Option) process {
+	t.Helper()
+	raw := h.New(t, namespace)
+	shared, rec := record(raw)
+	p := process{top: cache.NewMemory(), shared: rec, raw: raw}
+	s, err := cache.New(context.Background(), append([]cache.Option{
+		cache.WithTier(p.top, time.Minute),
+		cache.WithTier(shared, time.Minute),
+		cache.WithTTLJitter(0),
+	}, opts...)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.Close)
+	p.stack = s
+	return p
+}
+
+// settle waits until every invalidation notice a's layer has published so far
+// has reached b. Notices from one client arrive in order, so once b has
+// heard a later one, it has heard the earlier ones.
+func settle(t *testing.T, a, b process) {
+	t.Helper()
+	ctx := context.Background()
+	marker, key := cache.NewPartition(Namespace(t)), "settle"
+	if err := b.stack.Set(ctx, marker, key, []byte("before")); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.stack.Set(ctx, marker, key, []byte("after")); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 3*time.Second, func() bool {
+		got, err := b.stack.Get(ctx, marker, key)
+		return err == nil && string(got) == "after"
+	}, "the other process never heard a's notices")
+}
+
+// recorder counts the calls a stack makes on the layer it wraps, and keeps
+// the key of the last Set.
+type recorder struct {
+	mu  sync.Mutex
+	n   int
+	set string
+}
+
+func (r *recorder) called() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.n++
+}
+
+func (r *recorder) calls() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.n
+}
+
+func (r *recorder) lastSet() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.set
+}
+
+func (r *recorder) reset() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.n = 0
+}
+
+// record wraps l so every call on it is counted, keeping its Leaser,
+// Notifier and Resyncer roles: the stack must treat the wrapped layer exactly
+// as l. Subscriptions are not counted; the stack makes them once, when built.
+func record(l cache.Layer) (cache.Layer, *recorder) {
+	r := &recorder{}
+	base := recordedLayer{layer: l, r: r}
+	_, leases := l.(cache.Leaser)
+	_, notifies := l.(cache.Notifier)
+	_, resyncs := l.(cache.Resyncer)
+	switch {
+	case leases && resyncs:
+		return recordedLeaserResyncer{recordedLeaserNotifier{recordedLeaser{base}}}, r
+	case leases && notifies:
+		return recordedLeaserNotifier{recordedLeaser{base}}, r
+	case leases:
+		return recordedLeaser{base}, r
+	case resyncs:
+		return recordedResyncer{recordedNotifier{base}}, r
+	case notifies:
+		return recordedNotifier{base}, r
+	default:
+		return base, r
+	}
+}
+
+type recordedLayer struct {
+	layer cache.Layer
+	r     *recorder
+}
+
+func (x recordedLayer) Get(ctx context.Context, key string) (cache.Entry, error) {
+	x.r.called()
+	return x.layer.Get(ctx, key)
+}
+
+func (x recordedLayer) Set(ctx context.Context, key string, e cache.Entry, ttl time.Duration) error {
+	x.r.called()
+	x.r.mu.Lock()
+	x.r.set = key
+	x.r.mu.Unlock()
+	return x.layer.Set(ctx, key, e, ttl)
+}
+
+func (x recordedLayer) Delete(ctx context.Context, key string) error {
+	x.r.called()
+	return x.layer.Delete(ctx, key)
+}
+
+type recordedLeaser struct{ recordedLayer }
+
+func (x recordedLeaser) Acquire(ctx context.Context, key string, ttl time.Duration) (cache.Lease, bool, error) {
+	x.r.called()
+	return x.layer.(cache.Leaser).Acquire(ctx, key, ttl)
+}
+
+func (x recordedLeaser) Fill(ctx context.Context, lease cache.Lease, e cache.Entry, ttl time.Duration) error {
+	x.r.called()
+	return x.layer.(cache.Leaser).Fill(ctx, lease, e, ttl)
+}
+
+func (x recordedLeaser) Release(ctx context.Context, lease cache.Lease) error {
+	x.r.called()
+	return x.layer.(cache.Leaser).Release(ctx, lease)
+}
+
+type recordedNotifier struct{ recordedLayer }
+
+func (x recordedNotifier) Subscribe(ctx context.Context, fn func(key string)) (func(), error) {
+	return x.layer.(cache.Notifier).Subscribe(ctx, fn)
+}
+
+type recordedLeaserNotifier struct{ recordedLeaser }
+
+func (x recordedLeaserNotifier) Subscribe(ctx context.Context, fn func(key string)) (func(), error) {
+	return x.layer.(cache.Notifier).Subscribe(ctx, fn)
+}
+
+type recordedResyncer struct{ recordedNotifier }
+
+func (x recordedResyncer) SubscribeResync(ctx context.Context, fn func()) (func(), error) {
+	return x.layer.(cache.Resyncer).SubscribeResync(ctx, fn)
+}
+
+type recordedLeaserResyncer struct{ recordedLeaserNotifier }
+
+func (x recordedLeaserResyncer) SubscribeResync(ctx context.Context, fn func()) (func(), error) {
+	return x.layer.(cache.Resyncer).SubscribeResync(ctx, fn)
+}
+
+// viewerOrigin answers according to who asks, the way an origin that
+// authorizes with the caller's credentials does: the stack passes the
+// caller's context to Load, and the viewer rides on it. Each viewer sees its
+// own view of the value last written, or of the key's name before any write.
+type viewerOrigin struct {
+	delay time.Duration
+
+	mu      sync.Mutex
+	loads   map[string]int
+	hidden  map[string]bool
+	suffix  map[string]string
+	gates   map[string]chan struct{}
+	values  map[string]string
+	removed map[string]bool
+	version int
+}
+
+type viewerKey struct{}
+
+func asViewer(viewer string) context.Context {
+	return context.WithValue(context.Background(), viewerKey{}, viewer)
+}
+
+// partitionOf is the partition a viewer's reads are scoped to.
+func partitionOf(viewer string) cache.Partition { return cache.NewPartition("tenant-" + viewer) }
+
+func viewValue(key, viewer string) string { return key + " as seen by " + viewer }
+
+func newViewerOrigin() *viewerOrigin {
+	return &viewerOrigin{
+		loads:   map[string]int{},
+		hidden:  map[string]bool{},
+		suffix:  map[string]string{},
+		gates:   map[string]chan struct{}{},
+		values:  map[string]string{},
+		removed: map[string]bool{},
+	}
+}
+
+func (o *viewerOrigin) Load(ctx context.Context, key, _ string) (cache.Entry, error) {
+	viewer, _ := ctx.Value(viewerKey{}).(string)
+	o.mu.Lock()
+	o.loads[viewer]++
+	gate, hidden, suffix := o.gates[viewer], o.hidden[viewer], o.suffix[viewer]
+	value, written := o.values[key]
+	removed := o.removed[key]
+	o.mu.Unlock()
+	if !written {
+		value = key
+	}
+	time.Sleep(o.delay)
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return cache.Entry{}, ctx.Err()
+		}
+	}
+	if hidden || removed {
+		return cache.Entry{}, cache.ErrNotFound
+	}
+	return cache.Entry{Value: []byte(viewValue(value, viewer) + suffix), Version: "1"}, nil
+}
+
+// Put implements cache.Store.
+func (o *viewerOrigin) Put(_ context.Context, key string, value []byte) (string, error) {
+	o.put(key, string(value))
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return strconv.Itoa(o.version), nil
+}
+
+// Remove implements cache.Store.
+func (o *viewerOrigin) Remove(_ context.Context, key string) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.removed[key] = true
+	o.version++
+	return nil
+}
+
+// put writes key at the origin, bypassing any stack.
+func (o *viewerOrigin) put(key, value string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.values[key] = value
+	delete(o.removed, key)
+	o.version++
+}
+
+// hold makes viewer's loads block until the returned func is called.
+func (o *viewerOrigin) hold(viewer string) (release func()) {
+	gate := make(chan struct{})
+	o.mu.Lock()
+	o.gates[viewer] = gate
+	o.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			o.mu.Lock()
+			delete(o.gates, viewer)
+			o.mu.Unlock()
+			close(gate)
+		})
+	}
+}
+
+func (o *viewerOrigin) hide(viewer string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.hidden[viewer] = true
+}
+
+// setSuffix changes what viewer's loads return from now on.
+func (o *viewerOrigin) setSuffix(viewer, suffix string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.suffix[viewer] = suffix
+}
+
+func (o *viewerOrigin) loadsBy(viewer string) int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.loads[viewer]
+}
+
+func assertGet(t *testing.T, s *cache.Stack, viewer string, p cache.Partition, key, want string) {
+	t.Helper()
+	got, err := s.Get(asViewer(viewer), p, key)
+	if err != nil {
+		t.Fatalf("Get(%q) as %q: %v", key, viewer, err)
+	}
+	if string(got) != want {
+		t.Fatalf("Get(%q) as %q = %q, want %q", key, viewer, got, want)
+	}
+}
+
+func assertRefused(t *testing.T, name string, s *cache.Stack, p cache.Partition, want error) {
+	t.Helper()
+	ctx := context.Background()
+	for op, err := range map[string]error{
+		"Get":        func() error { _, err := s.Get(ctx, p, "k"); return err }(),
+		"GetEntry":   func() error { _, err := s.GetEntry(ctx, p, "k"); return err }(),
+		"Set":        s.Set(ctx, p, "k", []byte("v")),
+		"Delete":     s.Delete(ctx, p, "k"),
+		"Invalidate": s.Invalidate(ctx, p, "k"),
+	} {
+		if !errors.Is(err, want) {
+			t.Fatalf("%s with %s = %v, want %v", op, name, err, want)
+		}
 	}
 }
 
@@ -395,16 +1126,4 @@ func eventually(t *testing.T, within time.Duration, cond func() bool, msg string
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal(msg)
-}
-
-func equalStrings(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }

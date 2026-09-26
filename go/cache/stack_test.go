@@ -15,22 +15,113 @@ import (
 )
 
 // sharedMemory hands out clients of one store per namespace, the way several
-// processes hold clients of one server.
+// processes hold clients of one server. An external write goes through a
+// client no stack uses, as another program would.
 func sharedMemory() cachetest.Harness {
-	var mu sync.Mutex
-	stores := map[string]*cache.Memory{}
-	return cachetest.Harness{New: func(_ *testing.T, ns string) cache.Layer {
-		mu.Lock()
-		defer mu.Unlock()
-		if m, ok := stores[ns]; ok {
-			return m.Share()
-		}
-		stores[ns] = cache.NewMemory()
-		return stores[ns]
-	}}
+	return memoryHarness(func(m *cache.Memory) cache.Layer { return m })
 }
 
+// memoryHarness is sharedMemory with each client wrapped by wrap.
+func memoryHarness(wrap func(*cache.Memory) cache.Layer) cachetest.Harness {
+	var mu sync.Mutex
+	stores := map[string]*cache.Memory{}
+	store := func(ns string) *cache.Memory {
+		mu.Lock()
+		defer mu.Unlock()
+		if _, ok := stores[ns]; !ok {
+			stores[ns] = cache.NewMemory()
+		}
+		return stores[ns]
+	}
+	return cachetest.Harness{
+		New: func(_ *testing.T, ns string) cache.Layer { return wrap(store(ns).Share()) },
+		ExternalWrite: func(t *testing.T, ns, key string) {
+			if err := store(ns).Share().Set(context.Background(), key, cache.Entry{Value: []byte("external")}, time.Minute); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+}
+
+// tenant is the partition the tests that are not about partitioning read in.
+var tenant = cache.NewPartition("tenant")
+
 func TestMemoryConformance(t *testing.T) { cachetest.Run(t, sharedMemory()) }
+
+// echoMemory reports its own client's writes too, which the Notifier contract
+// allows: it subscribes through another client of the store.
+type echoMemory struct{ *cache.Memory }
+
+func (e echoMemory) Subscribe(ctx context.Context, fn func(string)) (func(), error) {
+	return e.Share().Subscribe(ctx, fn)
+}
+
+// A driver that reports its own writes passes the suite, and the stack over it
+// behaves the same.
+func TestEchoingNotifierConformance(t *testing.T) {
+	h := memoryHarness(func(m *cache.Memory) cache.Layer { return echoMemory{m} })
+	cachetest.Run(t, h)
+	cachetest.RunStack(t, h)
+}
+
+// lossyMemory is a Resyncer over Memory: during a gap it drops the notices
+// that arrive, then signals the resync, as a driver whose connection dropped
+// would.
+type lossyMemory struct {
+	*cache.Memory
+	mu      *sync.Mutex
+	dropped *bool
+	resyncs *[]func()
+}
+
+func newLossyMemory(m *cache.Memory) lossyMemory {
+	return lossyMemory{Memory: m, mu: &sync.Mutex{}, dropped: new(bool), resyncs: new([]func())}
+}
+
+func (l lossyMemory) Subscribe(ctx context.Context, fn func(string)) (func(), error) {
+	return l.Memory.Subscribe(ctx, func(key string) {
+		l.mu.Lock()
+		lost := *l.dropped
+		l.mu.Unlock()
+		if !lost {
+			fn(key)
+		}
+	})
+}
+
+func (l lossyMemory) SubscribeResync(_ context.Context, fn func()) (func(), error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	*l.resyncs = append(*l.resyncs, fn)
+	return func() {}, nil
+}
+
+// interrupt opens a gap, runs lose inside it, then closes it and signals.
+func (l lossyMemory) interrupt(lose func()) {
+	l.mu.Lock()
+	*l.dropped = true
+	l.mu.Unlock()
+	lose()
+	l.mu.Lock()
+	*l.dropped = false
+	fns := append([]func(){}, *l.resyncs...)
+	l.mu.Unlock()
+	for _, fn := range fns {
+		fn()
+	}
+}
+
+func lossyHarness() cachetest.Harness {
+	h := memoryHarness(func(m *cache.Memory) cache.Layer { return newLossyMemory(m) })
+	h.Interrupt = func(_ *testing.T, l cache.Layer) { l.(lossyMemory).interrupt(func() {}) }
+	return h
+}
+
+// The resync contract cases run against a Resyncer, and pass.
+func TestResyncerConformance(t *testing.T) {
+	cachetest.Run(t, lossyHarness())
+	cachetest.RunStack(t, lossyHarness())
+}
 
 // Two stacks, each with a private Memory over one shared Memory: the origin is
 // loaded once, which only holds if the stack leases on the deepest layer.
@@ -47,18 +138,18 @@ func TestRemoteWriteEvictsUpperTiers(t *testing.T) {
 		)
 	}
 	a, b := build(shared), build(shared.Share())
-	if err := a.Set(ctx, "k", []byte("one")); err != nil {
+	if err := a.Set(ctx, tenant, "k", []byte("one")); err != nil {
 		t.Fatal(err)
 	}
 	assertGet(t, b, "k", "one") // now in both of b's upper tiers
-	if err := a.Set(ctx, "k", []byte("two")); err != nil {
+	if err := a.Set(ctx, tenant, "k", []byte("two")); err != nil {
 		t.Fatal(err)
 	}
 	assertGet(t, b, "k", "two")
-	if err := a.Delete(ctx, "k"); err != nil {
+	if err := a.Delete(ctx, tenant, "k"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := b.Get(ctx, "k"); !errors.Is(err, cache.ErrMiss) {
+	if _, err := b.Get(ctx, tenant, "k"); !errors.Is(err, cache.ErrMiss) {
 		t.Fatalf("b still serves a key a deleted: %v", err)
 	}
 }
@@ -94,28 +185,27 @@ func TestAnyNumberOfTiers(t *testing.T) {
 	}
 }
 
-// A lost lease stores nothing: a key deleted while its fill was loading is not
-// refilled with the value loaded before the delete.
-func TestDeleteDuringLoadIsNotOverwritten(t *testing.T) {
+// A write that lands while a fill is loading, through another process and
+// another partition, is not undone by that fill: the fill is stored under the
+// generation the write replaced, so the next read loads the new value.
+func TestWriteDuringLoadIsNotOverwritten(t *testing.T) {
 	ctx := context.Background()
 	o := newOrigin()
 	o.put("k", "before")
 	o.delay = 100 * time.Millisecond
 	shared := cache.NewMemory()
 	s := newStack(t, cache.WithTier(shared, time.Hour), cache.WithOrigin(o))
+	other := newStack(t, cache.WithTier(shared.Share(), time.Hour), cache.WithOrigin(o))
 
 	done := make(chan struct{})
-	go func() { defer close(done); _, _ = s.Get(ctx, "k") }()
-	time.Sleep(30 * time.Millisecond) // the load holds the lease now
-	o.put("k", "after")
-	if err := shared.Share().Delete(ctx, "k"); err != nil { // another process invalidates
+	go func() { defer close(done); _, _ = s.Get(ctx, tenant, "k") }()
+	time.Sleep(30 * time.Millisecond) // the load is running now
+	if err := other.Set(ctx, cache.NewPartition("someone-else"), "k", []byte("after")); err != nil {
 		t.Fatal(err)
 	}
 	<-done
-	if _, err := shared.Get(ctx, "k"); !errors.Is(err, cache.ErrMiss) {
-		t.Fatalf("a fill that lost its lease was stored: %v", err)
-	}
 	assertGet(t, s, "k", "after")
+	assertGet(t, other, "k", "after")
 }
 
 func TestMemoryLimits(t *testing.T) {
@@ -204,17 +294,17 @@ func newStack(t *testing.T, opts ...cache.Option) *cache.Stack {
 func TestPlainCache(t *testing.T) {
 	ctx := context.Background()
 	s := newStack(t, cache.WithTier(cache.NewMemory(), time.Minute))
-	if _, err := s.Get(ctx, "k"); !errors.Is(err, cache.ErrMiss) {
+	if _, err := s.Get(ctx, tenant, "k"); !errors.Is(err, cache.ErrMiss) {
 		t.Fatalf("Get on empty plain cache = %v, want ErrMiss", err)
 	}
-	if err := s.Set(ctx, "k", []byte("v")); err != nil {
+	if err := s.Set(ctx, tenant, "k", []byte("v")); err != nil {
 		t.Fatal(err)
 	}
 	assertGet(t, s, "k", "v")
-	if err := s.Delete(ctx, "k"); err != nil {
+	if err := s.Delete(ctx, tenant, "k"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Get(ctx, "k"); !errors.Is(err, cache.ErrMiss) {
+	if _, err := s.Get(ctx, tenant, "k"); !errors.Is(err, cache.ErrMiss) {
 		t.Fatalf("Get after Delete = %v, want ErrMiss", err)
 	}
 }
@@ -231,18 +321,19 @@ func TestReadThroughFillsEveryTier(t *testing.T) {
 	if n := o.loads.Load(); n != 1 {
 		t.Fatalf("origin loaded %d times, want 1", n)
 	}
+	stored := cache.EntryKey(s, tenant, "k")
 	for name, l := range map[string]cache.Layer{"top": top, "bottom": bottom} {
-		if _, err := l.Get(ctx, "k"); err != nil {
+		if _, err := l.Get(ctx, stored); err != nil {
 			t.Fatalf("%s tier not filled: %v", name, err)
 		}
 	}
 
 	// A value only the lower tier holds is copied up, never fresher than it
 	// was below.
-	_ = top.Delete(ctx, "k")
+	_ = top.Delete(ctx, stored)
 	assertGet(t, s, "k", "v")
-	below, _ := bottom.Get(ctx, "k")
-	above, err := top.Get(ctx, "k")
+	below, _ := bottom.Get(ctx, stored)
+	above, err := top.Get(ctx, stored)
 	if err != nil {
 		t.Fatalf("top tier not refilled from bottom: %v", err)
 	}
@@ -279,8 +370,8 @@ func TestCallerContextDoesNotCancelSharedLoad(t *testing.T) {
 	short, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { _, err := s.Get(context.Background(), "k"); done <- err }()
-	if _, err := s.Get(short, "k"); !errors.Is(err, context.DeadlineExceeded) {
+	go func() { _, err := s.Get(context.Background(), tenant, "k"); done <- err }()
+	if _, err := s.Get(short, tenant, "k"); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("impatient caller got %v, want its own deadline", err)
 	}
 	if err := <-done; err != nil {
@@ -292,7 +383,7 @@ func TestNegativeCaching(t *testing.T) {
 	o := newOrigin()
 	s := newStack(t, cache.WithTier(cache.NewMemory(), time.Minute), cache.WithOrigin(o), cache.WithNegativeTTL(time.Minute))
 	for range 3 {
-		if _, err := s.Get(context.Background(), "absent"); !errors.Is(err, cache.ErrNotFound) {
+		if _, err := s.Get(context.Background(), tenant, "absent"); !errors.Is(err, cache.ErrNotFound) {
 			t.Fatalf("Get(absent) = %v, want ErrNotFound", err)
 		}
 	}
@@ -303,7 +394,7 @@ func TestNegativeCaching(t *testing.T) {
 	off := newOrigin()
 	s = newStack(t, cache.WithTier(cache.NewMemory(), time.Minute), cache.WithOrigin(off), cache.WithNegativeTTL(0))
 	for range 3 {
-		_, _ = s.Get(context.Background(), "absent")
+		_, _ = s.Get(context.Background(), tenant, "absent")
 	}
 	if n := off.loads.Load(); n != 3 {
 		t.Fatalf("with negative caching off, absent key loaded %d times, want 3", n)
@@ -337,7 +428,7 @@ func TestWritePolicies(t *testing.T) {
 		o.put("k", "old")
 		s := newStack(t, cache.WithTier(cache.NewMemory(), time.Minute), cache.WithOrigin(o))
 		assertGet(t, s, "k", "old")
-		if err := s.Set(ctx, "k", []byte("new")); err != nil {
+		if err := s.Set(ctx, tenant, "k", []byte("new")); err != nil {
 			t.Fatal(err)
 		}
 		assertGet(t, s, "k", "new")
@@ -348,10 +439,10 @@ func TestWritePolicies(t *testing.T) {
 	t.Run("Through", func(t *testing.T) {
 		o := newOrigin()
 		s := newStack(t, cache.WithTier(cache.NewMemory(), time.Minute), cache.WithOrigin(o), cache.WithWritePolicy(cache.WriteThrough))
-		if err := s.Set(ctx, "k", []byte("new")); err != nil {
+		if err := s.Set(ctx, tenant, "k", []byte("new")); err != nil {
 			t.Fatal(err)
 		}
-		e, err := s.GetEntry(ctx, "k")
+		e, err := s.GetEntry(ctx, tenant, "k")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -367,10 +458,10 @@ func TestWritePolicies(t *testing.T) {
 		o.put("k", "v")
 		s := newStack(t, cache.WithTier(cache.NewMemory(), time.Minute), cache.WithOrigin(o), cache.WithNegativeTTL(0))
 		assertGet(t, s, "k", "v")
-		if err := s.Delete(ctx, "k"); err != nil {
+		if err := s.Delete(ctx, tenant, "k"); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := s.Get(ctx, "k"); !errors.Is(err, cache.ErrNotFound) {
+		if _, err := s.Get(ctx, tenant, "k"); !errors.Is(err, cache.ErrNotFound) {
 			t.Fatalf("Get after Delete = %v, want ErrNotFound", err)
 		}
 	})
@@ -379,10 +470,10 @@ func TestWritePolicies(t *testing.T) {
 			return cache.Entry{}, cache.ErrNotFound
 		})
 		s := newStack(t, cache.WithTier(cache.NewMemory(), time.Minute), cache.WithOrigin(src))
-		if err := s.Set(ctx, "k", []byte("v")); !errors.Is(err, cache.ErrReadOnlyOrigin) {
+		if err := s.Set(ctx, tenant, "k", []byte("v")); !errors.Is(err, cache.ErrReadOnlyOrigin) {
 			t.Fatalf("Set over a read-only origin = %v, want ErrReadOnlyOrigin", err)
 		}
-		if err := s.Delete(ctx, "k"); !errors.Is(err, cache.ErrReadOnlyOrigin) {
+		if err := s.Delete(ctx, tenant, "k"); !errors.Is(err, cache.ErrReadOnlyOrigin) {
 			t.Fatalf("Delete over a read-only origin = %v, want ErrReadOnlyOrigin", err)
 		}
 	})
@@ -416,7 +507,7 @@ func TestFailingLayerDegrades(t *testing.T) {
 		cache.WithBreaker(3, time.Hour),
 	)
 	for i := range 20 {
-		if err := s.Invalidate(context.Background(), "k"); err == nil && i == 0 {
+		if err := s.Invalidate(context.Background(), tenant, "k"); err == nil && i == 0 {
 			t.Fatal("Invalidate hid a failed layer delete")
 		}
 		assertGet(t, s, "k", "v")
@@ -492,21 +583,24 @@ func TestTyped(t *testing.T) {
 	}
 	ctx := context.Background()
 	typed := cache.NewTyped(newStack(t, cache.WithTier(cache.NewMemory(), time.Minute)), cache.JSON[doc]())
-	if err := typed.Set(ctx, "d", doc{Title: "t", Pages: 3}); err != nil {
+	if err := typed.Set(ctx, tenant, "d", doc{Title: "t", Pages: 3}); err != nil {
 		t.Fatal(err)
 	}
-	got, err := typed.Get(ctx, "d")
+	got, err := typed.Get(ctx, tenant, "d")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got != (doc{Title: "t", Pages: 3}) {
 		t.Fatalf("Get = %+v", got)
 	}
+	if _, err := typed.Get(ctx, cache.Partition{}, "d"); !errors.Is(err, cache.ErrNoPartition) {
+		t.Fatalf("Get without a partition = %v, want ErrNoPartition", err)
+	}
 }
 
 func assertGet(t *testing.T, s *cache.Stack, key, want string) {
 	t.Helper()
-	got, err := s.Get(context.Background(), key)
+	got, err := s.Get(context.Background(), tenant, key)
 	if err != nil {
 		t.Errorf("Get(%q): %v", key, err)
 		return
@@ -520,5 +614,233 @@ func mustSet(t *testing.T, l cache.Layer, key, value string) {
 	t.Helper()
 	if err := l.Set(context.Background(), key, cache.Entry{Value: []byte(value)}, time.Minute); err != nil {
 		t.Fatal(err)
+	}
+}
+
+type viewerKey struct{}
+
+func asViewer(viewer string) context.Context {
+	return context.WithValue(context.Background(), viewerKey{}, viewer)
+}
+
+// viewerOrigin answers each caller with its own view of a key, as an origin
+// that authorizes with the caller's credentials does.
+func viewerOrigin(loads *sync.Map, delay time.Duration) cache.Source {
+	return cache.SourceFunc(func(ctx context.Context, key, _ string) (cache.Entry, error) {
+		viewer, _ := ctx.Value(viewerKey{}).(string)
+		n, _ := loads.LoadOrStore(viewer, new(atomic.Int32))
+		n.(*atomic.Int32).Add(1)
+		time.Sleep(delay)
+		return cache.Entry{Value: []byte(key + " for " + viewer)}, nil
+	})
+}
+
+// Fill-once collapses readers of one key in one partition, in a process and
+// across processes, and never hands one partition's load to another.
+func TestFillOnceDoesNotCrossPartitions(t *testing.T) {
+	var loads sync.Map
+	origin := viewerOrigin(&loads, 50*time.Millisecond)
+	shared := cache.NewMemory()
+	stacks := []*cache.Stack{
+		newStack(t, cache.WithTier(cache.NewMemory(), time.Minute), cache.WithTier(shared, time.Minute), cache.WithOrigin(origin)),
+		newStack(t, cache.WithTier(cache.NewMemory(), time.Minute), cache.WithTier(shared.Share(), time.Minute), cache.WithOrigin(origin)),
+	}
+	viewers := []string{"u", "v", "w"}
+	var wg sync.WaitGroup
+	for i := range 60 {
+		s, viewer := stacks[i%2], viewers[(i/2)%3]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			got, err := s.Get(asViewer(viewer), cache.NewPartition(viewer), "k")
+			if err != nil || string(got) != "k for "+viewer {
+				t.Errorf("%s read %q, %v", viewer, got, err)
+			}
+		}()
+	}
+	wg.Wait()
+	for _, viewer := range viewers {
+		n, ok := loads.Load(viewer)
+		if !ok || n.(*atomic.Int32).Load() != 1 {
+			t.Fatalf("origin loaded %v times for %s, want 1", n, viewer)
+		}
+	}
+}
+
+// A write-around partition writes the origin, drops the partition's cached
+// copy, and stores nothing; its reads each load the origin, shared with no
+// one.
+func TestWriteAroundOverStore(t *testing.T) {
+	ctx := context.Background()
+	o := newOrigin()
+	o.put("k", "old")
+	top, bottom := cache.NewMemory(), cache.NewMemory()
+	s := newStack(t, cache.WithTier(top, time.Minute), cache.WithTier(bottom, time.Minute), cache.WithOrigin(o),
+		cache.WithWritePolicy(cache.WriteThrough))
+	granted := cache.NewPartition("tenant", cache.WriteAround())
+	assertStoresNoCopy := func(what string) {
+		t.Helper()
+		stored := cache.EntryKey(s, tenant, "k")
+		for name, l := range map[string]*cache.Memory{"top": top, "bottom": bottom} {
+			if e, err := l.Get(ctx, stored); !errors.Is(err, cache.ErrMiss) {
+				t.Fatalf("a write-around %s stored %q in the %s tier", what, e.Value, name)
+			}
+		}
+	}
+
+	assertGet(t, s, "k", "old")
+	if err := s.Set(ctx, granted, "k", []byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	assertStoresNoCopy("write")
+	assertGet(t, s, "k", "new") // the partition's stale copy is no longer read
+
+	o.delay = 30 * time.Millisecond
+	before := o.loads.Load()
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if got, err := s.Get(ctx, granted, "k"); err != nil || string(got) != "new" {
+				t.Errorf("write-around read = %q, %v", got, err)
+			}
+		}()
+	}
+	wg.Wait()
+	if n := o.loads.Load() - before; n != 10 {
+		t.Fatalf("10 concurrent write-around reads loaded the origin %d times, want 10: a load under a grant is not shared", n)
+	}
+	if err := s.Delete(ctx, granted, "k"); err != nil {
+		t.Fatal(err)
+	}
+	assertStoresNoCopy("delete")
+	if _, err := s.Get(ctx, tenant, "k"); !errors.Is(err, cache.ErrNotFound) {
+		t.Fatalf("Get after a write-around Delete = %v, want ErrNotFound", err)
+	}
+}
+
+// A notice lost in a gap leaves a stale copy above the Resyncer; the resync
+// that follows flushes it, in every partition and generation.
+func TestResyncFlushesWhatAGapLost(t *testing.T) {
+	ctx := context.Background()
+	o := newOrigin()
+	o.put("k", "old")
+	shared := cache.NewMemory()
+	lossy := newLossyMemory(shared.Share())
+	top := cache.NewMemory()
+	s := newStack(t, cache.WithTier(top, time.Hour), cache.WithTier(lossy, time.Hour), cache.WithOrigin(o))
+	writer := newStack(t, cache.WithTier(shared.Share(), time.Hour), cache.WithOrigin(o))
+	other := cache.NewPartition("other")
+	assertGet(t, s, "k", "old")
+	if got, err := s.Get(ctx, other, "k"); err != nil || string(got) != "old" {
+		t.Fatalf("Get = %q, %v", got, err)
+	}
+
+	lossy.interrupt(func() {
+		if err := writer.Set(ctx, tenant, "k", []byte("new")); err != nil {
+			t.Fatal(err)
+		}
+		assertGet(t, s, "k", "old") // the notice was lost: the stale copy is served
+	})
+	if top.Len() != 0 {
+		t.Fatalf("the resync left %d entries in the tier above", top.Len())
+	}
+	assertGet(t, s, "k", "new")
+	if got, err := s.Get(ctx, other, "k"); err != nil || string(got) != "new" {
+		t.Fatalf("other partition after the resync = %q, %v", got, err)
+	}
+}
+
+// A fill whose read began before a resync stores nothing in the flushed tier:
+// what it read may be what the gap left stale.
+func TestFillDuringResyncIsNotStoredAbove(t *testing.T) {
+	o := newOrigin()
+	o.put("k", "v")
+	o.delay = 100 * time.Millisecond
+	lossy := newLossyMemory(cache.NewMemory())
+	top := cache.NewMemory()
+	s := newStack(t, cache.WithTier(top, time.Hour), cache.WithTier(lossy, time.Hour), cache.WithOrigin(o))
+
+	done := make(chan struct{})
+	go func() { defer close(done); assertGet(t, s, "k", "v") }()
+	time.Sleep(30 * time.Millisecond) // the origin load is running
+	lossy.interrupt(func() {})
+	<-done
+	if e, err := top.Get(context.Background(), cache.EntryKey(s, tenant, "k")); !errors.Is(err, cache.ErrMiss) {
+		t.Fatalf("a fill that began before the resync was stored above it: %q, %v", e.Value, err)
+	}
+}
+
+// A resync cannot name keys, so every tier above a Resyncer must be flushable.
+func TestNewRefusesUnflushableTierAboveResyncer(t *testing.T) {
+	_, err := cache.New(context.Background(),
+		cache.WithTier(&brokenLayer{}, time.Minute),
+		cache.WithTier(newLossyMemory(cache.NewMemory()), time.Minute),
+	)
+	if err == nil || !strings.Contains(err.Error(), "cannot be flushed") {
+		t.Fatalf("New = %v, want a refusal naming the unflushable tier", err)
+	}
+}
+
+// gatedLayer holds a Get of a copy that misses, for the caller whose context
+// carries hold, until release is closed: that reader has missed, and is slow
+// to act on it.
+type gatedLayer struct {
+	*cache.Memory
+	hold    any
+	missed  chan struct{}
+	release chan struct{}
+}
+
+func (g gatedLayer) Get(ctx context.Context, key string) (cache.Entry, error) {
+	e, err := g.Memory.Get(ctx, key)
+	if errors.Is(err, cache.ErrMiss) && ctx.Value(g.hold) != nil {
+		close(g.missed)
+		<-g.release
+	}
+	return e, err
+}
+
+// The fill-once race reported from service-redis#79: a reader misses just
+// before another process fills, and reaches its load only after its own
+// process's flight for the key has finished, so it starts a new flight whose
+// lease is free — the fill released it. The lease holder re-reads the key
+// before loading, so the origin is still loaded once.
+func TestLateMissAfterAnotherProcessFilledLoadsOnce(t *testing.T) {
+	type holdKey struct{}
+	o := newOrigin()
+	o.put("k", "v")
+	o.delay = 100 * time.Millisecond
+	shared := cache.NewMemory()
+	gate := gatedLayer{Memory: shared.Share(), hold: holdKey{}, missed: make(chan struct{}), release: make(chan struct{})}
+	a := newStack(t, cache.WithTier(shared, time.Hour), cache.WithOrigin(o))
+	b := newStack(t, cache.WithTier(cache.NewMemory(), time.Hour), cache.WithTier(gate, time.Hour), cache.WithOrigin(o))
+
+	// Both processes learn the generation first, so the late reader's miss is
+	// on the copy.
+	if _, err := b.Get(context.Background(), cache.NewPartition("warm"), "k"); err != nil {
+		t.Fatal(err)
+	}
+	loads := o.loads.Load()
+
+	aDone := make(chan struct{})
+	go func() { defer close(aDone); assertGet(t, a, "k", "v") }() // a takes the lease and loads
+	time.Sleep(20 * time.Millisecond)
+	late := make(chan struct{})
+	go func() {
+		defer close(late)
+		ctx := context.WithValue(context.Background(), holdKey{}, true)
+		if got, err := b.Get(ctx, tenant, "k"); err != nil || string(got) != "v" {
+			t.Errorf("late reader = %q, %v", got, err)
+		}
+	}()
+	<-gate.missed
+	assertGet(t, b, "k", "v") // b's own flight waits for a's fill, and finishes
+	<-aDone
+	close(gate.release) // the late reader reaches load now, after a's fill
+	<-late
+	if n := o.loads.Load() - loads; n != 1 {
+		t.Fatalf("origin loaded %d times, want 1", n)
 	}
 }

@@ -213,12 +213,13 @@ func TestStackOverObjectStorage(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
+	p := cache.NewPartition("tenant")
 
-	if err := s.Set(ctx, key(t), []byte("doc v1")); err != nil {
+	if err := s.Set(ctx, p, key(t), []byte("doc v1")); err != nil {
 		t.Fatal(err)
 	}
 	for range 3 {
-		if v, err := s.Get(ctx, key(t)); err != nil || string(v) != "doc v1" {
+		if v, err := s.Get(ctx, p, key(t)); err != nil || string(v) != "doc v1" {
 			t.Fatalf("Get = %q, %v", v, err)
 		}
 	}
@@ -227,7 +228,7 @@ func TestStackOverObjectStorage(t *testing.T) {
 	}
 
 	time.Sleep(80 * time.Millisecond) // past freshness, inside the stale window
-	if v, err := s.Get(ctx, key(t)); err != nil || string(v) != "doc v1" {
+	if v, err := s.Get(ctx, p, key(t)); err != nil || string(v) != "doc v1" {
 		t.Fatalf("Get after expiry = %q, %v", v, err)
 	}
 	if n := src.conditional.Load(); n != 1 {

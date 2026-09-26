@@ -26,9 +26,16 @@ const (
 // Stack reads through its layers, top first, down to the origin, and fills
 // the layers on the way back. Build one with New; it is safe for concurrent
 // use.
+//
+// Every operation takes a Partition, and fails closed without one: the stack
+// never serves one partition's data, fill or negative entry to another. A
+// stack built WithGlobal takes Global instead. Over an origin, a write reaches
+// every partition's copies: each key has a generation that all copies are
+// stored under, and a write replaces it.
 type Stack struct {
 	tiers           []*tier
 	origin          Source
+	global          bool
 	policy          WritePolicy
 	negativeTTL     time.Duration
 	leaseTTL        time.Duration
@@ -41,12 +48,19 @@ type Stack struct {
 
 	flight singleflight.Group
 	stops  []func()
+
+	// resyncMu orders resyncs against fills of the tiers they flush: a fill
+	// that read before a resync must not store into a tier it flushed.
+	resyncMu sync.RWMutex
+	resyncs  uint64
 }
 
 type tier struct {
 	layer   Layer
 	ttl     time.Duration
 	breaker *breaker
+	// flushed marks a tier above a Resyncer, which a resync empties.
+	flushed bool
 }
 
 // Option configures a Stack.
@@ -150,8 +164,17 @@ func WithBreaker(failures int, cooldown time.Duration) Option {
 	}
 }
 
+// WithGlobal builds a stack for data that does not vary by viewer: every
+// operation takes Global(), and a caller's partition is refused with
+// ErrWrongPartition. Use it only when every caller may read every entry; it is
+// where a reviewer looks for a cross-viewer leak.
+func WithGlobal() Option {
+	return func(s *Stack) error { s.global = true; return nil }
+}
+
 // New builds a stack. It needs at least one layer or an origin. Layers that are
-// Notifiers are subscribed here, so New fails when one cannot be reached.
+// Notifiers are subscribed here, so New fails when one cannot be reached. Every
+// layer above a Resyncer must be a Flusher.
 func New(ctx context.Context, opts ...Option) (*Stack, error) {
 	s := &Stack{
 		negativeTTL:     5 * time.Second,
@@ -179,6 +202,16 @@ func New(ctx context.Context, opts ...Option) (*Stack, error) {
 			continue
 		}
 		above := s.tiers[:i]
+		resyncer, resyncs := notifier.(Resyncer)
+		if resyncs {
+			for j, a := range above {
+				if _, ok := a.layer.(Flusher); !ok {
+					s.Close()
+					return nil, fmt.Errorf("cache: tier %d is above tier %d, which can lose invalidations, but cannot be flushed on a resync (it is not a Flusher)", j, i)
+				}
+				a.flushed = true
+			}
+		}
 		stop, err := notifier.Subscribe(ctx, func(key string) {
 			for _, a := range above {
 				_ = a.layer.Delete(context.Background(), key)
@@ -189,8 +222,35 @@ func New(ctx context.Context, opts ...Option) (*Stack, error) {
 			return nil, fmt.Errorf("cache: subscribe to invalidations of tier %d: %w", i, err)
 		}
 		s.stops = append(s.stops, stop)
+		if resyncs {
+			stop, err := resyncer.SubscribeResync(ctx, func() { s.resync(above) })
+			if err != nil {
+				s.Close()
+				return nil, fmt.Errorf("cache: subscribe to resyncs of tier %d: %w", i, err)
+			}
+			s.stops = append(s.stops, stop)
+		}
 	}
 	return s, nil
+}
+
+// resync empties the tiers above a Resyncer that may have lost notices: any
+// of their copies, of any partition, and any generation they hold may be
+// stale. Fills that read before it store nothing into them.
+func (s *Stack) resync(above []*tier) {
+	s.resyncMu.Lock()
+	defer s.resyncMu.Unlock()
+	s.resyncs++
+	for _, t := range above {
+		_ = t.layer.(Flusher).Flush(context.Background())
+	}
+}
+
+// since returns the resync count a read starts from.
+func (s *Stack) since() uint64 {
+	s.resyncMu.RLock()
+	defer s.resyncMu.RUnlock()
+	return s.resyncs
 }
 
 // Close stops the stack's invalidation subscriptions. It does not close the
@@ -202,10 +262,11 @@ func (s *Stack) Close() {
 	s.stops = nil
 }
 
-// Get returns the value for key. It is ErrNotFound when the origin holds none,
-// and ErrMiss when the stack has no origin and no layer holds the key.
-func (s *Stack) Get(ctx context.Context, key string) ([]byte, error) {
-	e, err := s.GetEntry(ctx, key)
+// Get returns the value for key in partition p. It is ErrNotFound when the
+// origin holds none, and ErrMiss when the stack has no origin and no layer
+// holds the key.
+func (s *Stack) Get(ctx context.Context, p Partition, key string) ([]byte, error) {
+	e, err := s.GetEntry(ctx, p, key)
 	if err != nil {
 		return nil, err
 	}
@@ -217,14 +278,76 @@ func (s *Stack) Get(ctx context.Context, key string) ([]byte, error) {
 
 // GetEntry is Get returning the whole entry, version included. A negative
 // entry is returned as an Entry with Missing set, not as an error.
-func (s *Stack) GetEntry(ctx context.Context, key string) (Entry, error) {
+//
+// With an origin, the entry is p's copy under the key's current generation,
+// so a write through any partition — which replaces the generation — is never
+// followed by a read of a copy filled before it.
+//
+// In a write-around partition the read goes to the origin alone: it consults
+// no layer, takes no lease, shares its load with no other caller and stores
+// nothing. Without an origin it is ErrMiss.
+func (s *Stack) GetEntry(ctx context.Context, p Partition, key string) (Entry, error) {
+	if err := s.check(p); err != nil {
+		return Entry{}, err
+	}
+	if p.writeAround {
+		return s.loadAround(ctx, key)
+	}
+	// One resync snapshot for the whole read: a generation read before a
+	// resync may be one the resync exists to drop.
+	since := s.since()
+	if s.origin == nil {
+		return s.read(ctx, fill{layer: p.layerKey(key), since: since})
+	}
+	generation, err := s.generation(ctx, since, key)
+	if err != nil {
+		return Entry{}, err
+	}
+	return s.read(ctx, fill{
+		layer: p.entryKey(generation, key),
+		since: since,
+		load: func(ctx context.Context, ifNot string) (Entry, error) {
+			return s.origin.Load(ctx, key, ifNot)
+		},
+	})
+}
+
+// check refuses a partition that does not match the stack. Every operation
+// calls it before touching a layer or the origin.
+func (s *Stack) check(p Partition) error {
+	switch {
+	case !p.global && p.key == "":
+		return ErrNoPartition
+	case s.global && !p.global:
+		return fmt.Errorf("%w: the stack is built WithGlobal, so it takes cache.Global(), not a caller's partition", ErrWrongPartition)
+	case !s.global && p.global:
+		return fmt.Errorf("%w: cache.Global() is only for a stack built WithGlobal", ErrWrongPartition)
+	}
+	return nil
+}
+
+// fill is one layer key, and how to load it on a miss. Everything below read
+// — tiers, leases, in-process loads — is keyed by layer, which already names
+// the partition and the generation.
+type fill struct {
+	layer string
+	// since is the resync count when the operation began; what it found must
+	// not be stored into a flushed tier after a later resync.
+	since uint64
+	// load returns the value for layer; nil means the layers are all there
+	// is, and a miss is ErrMiss.
+	load func(ctx context.Context, ifNot string) (Entry, error)
+}
+
+// read walks the tiers top-down for f.layer, and loads it on a miss.
+func (s *Stack) read(ctx context.Context, f fill) (Entry, error) {
 	now := s.now()
 	var stale *Entry
 	for i, t := range s.tiers {
 		if !t.breaker.allow() {
 			continue
 		}
-		e, err := t.layer.Get(ctx, key)
+		e, err := t.layer.Get(ctx, f.layer)
 		if errors.Is(err, ErrMiss) {
 			t.breaker.success()
 			continue
@@ -235,26 +358,79 @@ func (s *Stack) GetEntry(ctx context.Context, key string) (Entry, error) {
 		}
 		t.breaker.success()
 		if e.Fresh(now) {
-			s.fillAbove(ctx, i, key, e)
+			s.fillAbove(ctx, f.since, i, f.layer, e)
 			return e, nil
 		}
 		if stale == nil {
 			stale = &e
 		}
 	}
+	if f.load == nil {
+		return Entry{}, ErrMiss
+	}
+	return s.load(ctx, f, stale)
+}
+
+// generation returns key's current generation, minting one — once across
+// processes, like any fill — when no layer holds it. It must be read before
+// the origin is loaded: a fill is stored under the generation current when
+// its load started, so a write that lands during the load orphans it.
+func (s *Stack) generation(ctx context.Context, since uint64, key string) (string, error) {
+	if len(s.tiers) == 0 {
+		return "", nil // nothing is stored, so nothing needs invalidating
+	}
+	e, err := s.read(ctx, fill{layer: generationKey(key), load: mintGeneration, since: since})
+	if err != nil {
+		return "", err
+	}
+	return string(e.Value), nil
+}
+
+// mintGeneration is the "origin" of a generation. An expired generation is
+// kept, not replaced: replacing it would orphan every copy made under it.
+func mintGeneration(_ context.Context, ifNot string) (Entry, error) {
+	if ifNot != "" {
+		return Entry{}, ErrNotModified
+	}
+	g := newGeneration()
+	return Entry{Value: []byte(g), Version: g}, nil
+}
+
+// bump gives key a new generation in every layer, so no partition's copy made
+// before it is read again. Every layer is attempted, even one the breaker is
+// skipping for reads, and failures are returned: a layer left on the old
+// generation keeps serving the old copies until their TTL.
+func (s *Stack) bump(ctx context.Context, key string) (string, error) {
+	if len(s.tiers) == 0 {
+		return "", nil
+	}
+	g := newGeneration()
+	return g, s.setAll(ctx, generationKey(key), Entry{Value: []byte(g), Version: g})
+}
+
+// loadAround serves a write-around read from the origin, stored nowhere and
+// shared with no other caller: the load ran under the caller's own grant.
+func (s *Stack) loadAround(ctx context.Context, key string) (Entry, error) {
 	if s.origin == nil {
 		return Entry{}, ErrMiss
 	}
-	return s.load(ctx, key, stale)
+	lctx, cancel := context.WithTimeout(ctx, s.loadTimeout)
+	defer cancel()
+	e, err := s.origin.Load(lctx, key, "")
+	if errors.Is(err, ErrNotFound) {
+		return Entry{Missing: true}, nil
+	}
+	return e, err
 }
 
-// load collapses concurrent misses for key in this process into one call to
+// load collapses concurrent misses for one layer key — one key in one
+// partition under one generation — in this process into one call to
 // loadShared, and lets each caller stop waiting when its own context ends.
-func (s *Stack) load(ctx context.Context, key string, stale *Entry) (Entry, error) {
-	ch := s.flight.DoChan(key, func() (any, error) {
+func (s *Stack) load(ctx context.Context, f fill, stale *Entry) (Entry, error) {
+	ch := s.flight.DoChan(f.layer, func() (any, error) {
 		lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.loadTimeout)
 		defer cancel()
-		return s.loadShared(lctx, key, stale)
+		return s.loadShared(lctx, f, stale)
 	})
 	select {
 	case <-ctx.Done():
@@ -269,34 +445,47 @@ func (s *Stack) load(ctx context.Context, key string, stale *Entry) (Entry, erro
 
 // loadShared collapses misses across processes: the deepest layer that grants
 // leases decides which process loads the origin; the others wait for its fill.
-func (s *Stack) loadShared(ctx context.Context, key string, stale *Entry) (Entry, error) {
+func (s *Stack) loadShared(ctx context.Context, f fill, stale *Entry) (Entry, error) {
 	idx, leaser := s.leaser()
 	if leaser == nil {
-		return s.loadOrigin(ctx, key, stale, -1, nil)
+		return s.loadOrigin(ctx, f, stale, -1, nil)
 	}
 	t := s.tiers[idx]
 	giveUp := s.now().Add(2 * s.leaseTTL)
 	for {
-		lease, ok, err := leaser.Acquire(ctx, key, s.leaseTTL)
+		lease, ok, err := leaser.Acquire(ctx, f.layer, s.leaseTTL)
 		if err != nil {
 			t.breaker.failure()
-			return s.loadOrigin(ctx, key, stale, idx, nil)
+			return s.loadOrigin(ctx, f, stale, idx, nil)
 		}
 		if ok {
-			return s.loadOrigin(ctx, key, stale, idx, &lease)
+			// Another process may have filled the key between this one's miss
+			// and its lease. Use that fill: loading again would replace a
+			// generation, orphaning every copy made under it.
+			if e, err := leaser.Get(ctx, f.layer); err == nil {
+				if e.Fresh(s.now()) {
+					_ = leaser.Release(ctx, lease)
+					s.fillAbove(ctx, f.since, idx, f.layer, e)
+					return e, nil
+				}
+				if stale == nil {
+					stale = &e
+				}
+			}
+			return s.loadOrigin(ctx, f, stale, idx, &lease)
 		}
-		e, filled, err := s.waitForFill(ctx, leaser, key)
+		e, filled, err := s.waitForFill(ctx, leaser, f.layer)
 		if err != nil {
 			return Entry{}, err
 		}
 		if filled {
-			s.fillAbove(ctx, idx, key, e)
+			s.fillAbove(ctx, f.since, idx, f.layer, e)
 			return e, nil
 		}
 		if !s.now().Before(giveUp) {
 			// The holder never filled, twice over: load without coordinating
 			// rather than wait forever, and leave the shared layer alone.
-			return s.loadOrigin(ctx, key, stale, idx, nil)
+			return s.loadOrigin(ctx, f, stale, idx, nil)
 		}
 	}
 }
@@ -325,17 +514,17 @@ func (s *Stack) waitForFill(ctx context.Context, leaser Leaser, key string) (Ent
 	return Entry{}, false, nil
 }
 
-// loadOrigin loads key from the origin and stores the result. With a lease,
+// loadOrigin loads f and stores the result. With a lease,
 // the leasing layer is filled under it, and a lost lease means nothing is
 // stored anywhere: the key changed while loading. Without a lease, the leasing
 // layer at skip (if any) is left alone, since storing there unleased could
 // overwrite a newer value.
-func (s *Stack) loadOrigin(ctx context.Context, key string, stale *Entry, skip int, lease *Lease) (Entry, error) {
+func (s *Stack) loadOrigin(ctx context.Context, f fill, stale *Entry, skip int, lease *Lease) (Entry, error) {
 	ifNot := ""
 	if stale != nil && !stale.Missing {
 		ifNot = stale.Version
 	}
-	e, err := s.origin.Load(ctx, key, ifNot)
+	e, err := f.load(ctx, ifNot)
 	switch {
 	case err == nil:
 	case errors.Is(err, ErrNotModified) && ifNot != "":
@@ -359,7 +548,7 @@ func (s *Stack) loadOrigin(ctx context.Context, key string, stale *Entry, skip i
 	if lease != nil {
 		t := s.tiers[skip]
 		stored, ttl := s.stamp(e, t.ttl, now)
-		err := t.layer.(Leaser).Fill(ctx, *lease, stored, ttl)
+		err := s.fillLeased(ctx, f.since, t, *lease, stored, ttl)
 		switch {
 		case errors.Is(err, ErrLeaseLost):
 			return e, nil
@@ -373,15 +562,30 @@ func (s *Stack) loadOrigin(ctx context.Context, key string, stale *Entry, skip i
 			continue
 		}
 		stored, ttl := s.stamp(e, t.ttl, now)
-		s.store(ctx, t, key, stored, ttl)
+		s.store(ctx, f.since, t, f.layer, stored, ttl)
 	}
 	stored, _ := s.stamp(e, s.shortestTTL(), now)
 	return stored, nil
 }
 
+// fillLeased stores e under lease, unless the leasing tier is flushed and a
+// resync came after the fill's read began: the lease is then given up.
+func (s *Stack) fillLeased(ctx context.Context, since uint64, t *tier, lease Lease, e Entry, ttl time.Duration) error {
+	leaser := t.layer.(Leaser)
+	if t.flushed {
+		s.resyncMu.RLock()
+		defer s.resyncMu.RUnlock()
+		if s.resyncs != since {
+			_ = leaser.Release(ctx, lease)
+			return ErrLeaseLost
+		}
+	}
+	return leaser.Fill(ctx, lease, e, ttl)
+}
+
 // fillAbove copies an entry found in tier i into the tiers above it, never
 // fresher than it was below.
-func (s *Stack) fillAbove(ctx context.Context, i int, key string, e Entry) {
+func (s *Stack) fillAbove(ctx context.Context, since uint64, i int, key string, e Entry) {
 	now := s.now()
 	for _, t := range s.tiers[:i] {
 		stored, ttl := s.stamp(e, t.ttl, now)
@@ -393,7 +597,7 @@ func (s *Stack) fillAbove(ctx context.Context, i int, key string, e Entry) {
 			}
 		}
 		if ttl > 0 {
-			s.store(ctx, t, key, stored, ttl)
+			s.store(ctx, since, t, key, stored, ttl)
 		}
 	}
 }
@@ -414,10 +618,18 @@ func (s *Stack) stamp(e Entry, ttl time.Duration, now time.Time) (Entry, time.Du
 	return e, ttl
 }
 
-// store is a best-effort fill: a layer the breaker is skipping is left alone.
-func (s *Stack) store(ctx context.Context, t *tier, key string, e Entry, ttl time.Duration) {
+// store is a best-effort fill: a layer the breaker is skipping is left alone,
+// and so is a flushed tier after a resync the fill's read began before.
+func (s *Stack) store(ctx context.Context, since uint64, t *tier, key string, e Entry, ttl time.Duration) {
 	if !t.breaker.allow() {
 		return
+	}
+	if t.flushed {
+		s.resyncMu.RLock()
+		defer s.resyncMu.RUnlock()
+		if s.resyncs != since {
+			return
+		}
 	}
 	err := t.layer.Set(ctx, key, e, ttl)
 	if err != nil && !errors.Is(err, ErrTooLarge) {
@@ -450,62 +662,95 @@ func (s *Stack) shortestTTL() time.Duration {
 	return shortest
 }
 
-// Set writes value for key. With a Store origin it writes the origin first,
-// then applies the write policy; with a read-only origin it is
-// ErrReadOnlyOrigin; with no origin it stores value in every layer.
-func (s *Stack) Set(ctx context.Context, key string, value []byte) error {
-	e := Entry{Value: value}
-	if s.origin != nil {
-		store, ok := s.origin.(Store)
-		if !ok {
-			return ErrReadOnlyOrigin
-		}
-		version, err := store.Put(ctx, key, value)
-		if err != nil {
-			return err
-		}
-		if s.policy == WriteInvalidate {
-			return s.Invalidate(ctx, key)
-		}
-		e.Version = version
+// Set writes value for key in partition p. With a Store origin it writes the
+// origin first, then gives key a new generation, so no partition reads a copy
+// made before the write; WriteThrough also stores value as p's copy. With a
+// read-only origin it is ErrReadOnlyOrigin. With no origin it stores value in
+// every layer, as p's value alone.
+//
+// In a write-around partition nothing is stored: over an origin the write
+// only replaces the generation, and with none it drops p's value.
+func (s *Stack) Set(ctx context.Context, p Partition, key string, value []byte) error {
+	if err := s.check(p); err != nil {
+		return err
 	}
-	// Bottom-up, so a layer above is never set before the one it would refill
-	// from.
+	if s.origin == nil {
+		if p.writeAround {
+			return s.invalidate(ctx, p.layerKey(key))
+		}
+		return s.setAll(ctx, p.layerKey(key), Entry{Value: value})
+	}
+	store, ok := s.origin.(Store)
+	if !ok {
+		return ErrReadOnlyOrigin
+	}
+	version, err := store.Put(ctx, key, value)
+	if err != nil {
+		return err
+	}
+	generation, err := s.bump(ctx, key)
+	if err != nil || s.policy == WriteInvalidate || p.writeAround {
+		return err
+	}
+	return s.setAll(ctx, p.entryKey(generation, key), Entry{Value: value, Version: version})
+}
+
+// setAll stores e under layerKey in every layer, bottom-up, so a layer above
+// is never set before the one it would refill from.
+func (s *Stack) setAll(ctx context.Context, layerKey string, e Entry) error {
 	now := s.now()
 	var errs []error
 	for i := len(s.tiers) - 1; i >= 0; i-- {
 		t := s.tiers[i]
 		stored, ttl := s.stamp(e, t.ttl, now)
-		if err := t.layer.Set(ctx, key, stored, ttl); err != nil && !errors.Is(err, ErrTooLarge) {
+		if err := t.layer.Set(ctx, layerKey, stored, ttl); err != nil && !errors.Is(err, ErrTooLarge) {
 			errs = append(errs, fmt.Errorf("tier %d: %w", i, err))
 		}
 	}
 	return errors.Join(errs...)
 }
 
-// Delete removes key: from a Store origin first, then from every layer. With a
-// read-only origin it is ErrReadOnlyOrigin.
-func (s *Stack) Delete(ctx context.Context, key string) error {
-	if s.origin != nil {
-		store, ok := s.origin.(Store)
-		if !ok {
-			return ErrReadOnlyOrigin
-		}
-		if err := store.Remove(ctx, key); err != nil {
-			return err
-		}
+// Delete removes key: from a Store origin first, then from every partition's
+// copies by giving key a new generation. With a read-only origin it is
+// ErrReadOnlyOrigin. With no origin it removes p's value from every layer.
+func (s *Stack) Delete(ctx context.Context, p Partition, key string) error {
+	if err := s.check(p); err != nil {
+		return err
 	}
-	return s.Invalidate(ctx, key)
+	if s.origin == nil {
+		return s.invalidate(ctx, p.layerKey(key))
+	}
+	store, ok := s.origin.(Store)
+	if !ok {
+		return ErrReadOnlyOrigin
+	}
+	if err := store.Remove(ctx, key); err != nil {
+		return err
+	}
+	_, err := s.bump(ctx, key)
+	return err
 }
 
-// Invalidate drops key from every layer without touching the origin — for a
-// write the origin received some other way. Every layer is attempted, even
-// one the breaker is skipping for reads: a missed invalidation serves a stale
-// value until its TTL, so failures are returned.
-func (s *Stack) Invalidate(ctx context.Context, key string) error {
+// Invalidate drops every partition's copy of key without touching the origin
+// — for a write the origin received some other way — by giving key a new
+// generation; p must still match the stack. Every layer is attempted, even one
+// the breaker is skipping for reads: a missed invalidation serves a stale value
+// until its TTL, so failures are returned. With no origin it drops p's value.
+func (s *Stack) Invalidate(ctx context.Context, p Partition, key string) error {
+	if err := s.check(p); err != nil {
+		return err
+	}
+	if s.origin == nil {
+		return s.invalidate(ctx, p.layerKey(key))
+	}
+	_, err := s.bump(ctx, key)
+	return err
+}
+
+func (s *Stack) invalidate(ctx context.Context, layerKey string) error {
 	var errs []error
 	for i := len(s.tiers) - 1; i >= 0; i-- {
-		if err := s.tiers[i].layer.Delete(ctx, key); err != nil {
+		if err := s.tiers[i].layer.Delete(ctx, layerKey); err != nil {
 			errs = append(errs, fmt.Errorf("tier %d: %w", i, err))
 		}
 	}

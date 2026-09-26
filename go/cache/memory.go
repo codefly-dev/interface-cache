@@ -16,9 +16,9 @@ import (
 // layer under several stacks in one process — Share returns another client of
 // the same store, the way a second process would hold a second Redis client.
 //
-// Notifications are delivered synchronously and are never lost, which makes
-// Memory the reference implementation the conformance suite is checked
-// against without a server.
+// Notifications are delivered synchronously and are never lost, so Memory is
+// a Notifier that needs no resync signal, and the reference implementation the
+// conformance suite is checked against without a server.
 type Memory struct {
 	store  *memoryStore
 	client uint64 // identifies this handle's own writes
@@ -27,6 +27,7 @@ type Memory struct {
 var (
 	_ Leaser   = (*Memory)(nil)
 	_ Notifier = (*Memory)(nil)
+	_ Flusher  = (*Memory)(nil)
 )
 
 type memoryStore struct {
@@ -191,8 +192,9 @@ func (m *Memory) Release(_ context.Context, lease Lease) error {
 	return nil
 }
 
-// Subscribe implements Notifier: fn hears keys other clients of this store Set
-// or Delete, synchronously, after the write.
+// Subscribe implements Notifier: fn hears keys other clients of this store Set,
+// Delete or Flush, synchronously, after the write. A client's own writes are
+// not reported to its own subscribers, which the Notifier contract allows.
 func (m *Memory) Subscribe(_ context.Context, fn func(key string)) (func(), error) {
 	s := m.store
 	s.mu.Lock()
@@ -208,6 +210,26 @@ func (m *Memory) Subscribe(_ context.Context, fn func(key string)) (func(), erro
 			s.mu.Unlock()
 		})
 	}, nil
+}
+
+// Flush implements Flusher: it drops every entry and lease in the store, and
+// reports each dropped key to other clients' subscribers.
+func (m *Memory) Flush(context.Context) error {
+	s := m.store
+	s.mu.Lock()
+	keys := make([]string, 0, len(s.items))
+	for key := range s.items {
+		keys = append(keys, key)
+	}
+	s.order.Init()
+	clear(s.items)
+	clear(s.leases)
+	notify := s.subscribersLocked(m.client)
+	s.mu.Unlock()
+	for _, key := range keys {
+		deliver(notify, key)
+	}
+	return nil
 }
 
 // Len reports how many keys the store holds, expired ones included until they

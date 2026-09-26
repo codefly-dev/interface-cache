@@ -36,9 +36,10 @@ func NewTyped[T any](stack *Stack, codec Codec[T]) *Typed[T] {
 	return &Typed[T]{stack: stack, codec: codec}
 }
 
-// Get returns the decoded value for key, with Stack.Get's errors.
-func (t *Typed[T]) Get(ctx context.Context, key string) (T, error) {
-	data, err := t.stack.Get(ctx, key)
+// Get returns the decoded value for key in partition p, with Stack.Get's
+// errors.
+func (t *Typed[T]) Get(ctx context.Context, p Partition, key string) (T, error) {
+	data, err := t.stack.Get(ctx, p, key)
 	if err != nil {
 		var zero T
 		return zero, err
@@ -47,17 +48,17 @@ func (t *Typed[T]) Get(ctx context.Context, key string) (T, error) {
 }
 
 // Set encodes v and writes it as Stack.Set does.
-func (t *Typed[T]) Set(ctx context.Context, key string, v T) error {
+func (t *Typed[T]) Set(ctx context.Context, p Partition, key string, v T) error {
 	data, err := t.codec.Marshal(v)
 	if err != nil {
 		return err
 	}
-	return t.stack.Set(ctx, key, data)
+	return t.stack.Set(ctx, p, key, data)
 }
 
 // Delete removes key as Stack.Delete does.
-func (t *Typed[T]) Delete(ctx context.Context, key string) error {
-	return t.stack.Delete(ctx, key)
+func (t *Typed[T]) Delete(ctx context.Context, p Partition, key string) error {
+	return t.stack.Delete(ctx, p, key)
 }
 
 // Stack returns the underlying stack.

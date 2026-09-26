@@ -16,9 +16,9 @@ runtime. Roadmap: [codefly-dev/.github#7](https://github.com/codefly-dev/.github
 | Path | What |
 |---|---|
 | `definition/cache.json` | The published interface: kind `capability`, the `cache` configuration group (`driver`; `connection`, secret). Providers are held to it. |
-| `go/cache` | `Layer`, `Source`, `Store`, the `Stack` (any number of layers), `Open` + driver registry, `Typed[T]`, and `Memory`: a complete in-process backend (leases, notifications; `Share()` gives several stacks one store). Depends on nothing but `golang.org/x/sync`. |
-| `go/cache/cachetest` | Conformance suite: `Run` (Layer, Leaser, Notifier contracts) and `RunStack` (fill-once across processes). |
-| `go/sources/objectstorage` | Origin adapter over the object-storage gateway client: loads conditional on ETag. |
+| `go/cache` | `Layer`, `Source`, `Store`, `Partition`, the `Stack` (any number of layers), `Open` + driver registry, `Typed[T]`, and `Memory`: a complete in-process backend (leases, notifications; `Share()` gives several stacks one store). Depends on nothing but `golang.org/x/sync`. |
+| `go/cache/cachetest` | Conformance suite: `Run` (Layer, Leaser, Notifier and Resyncer contracts) and `RunStack` (fill-once across processes, partition isolation, eviction on external writes and resyncs). A harness may provide `ExternalWrite` (change a key bypassing the driver) and must provide `Interrupt` for a Resyncer. |
+| `go/sources/objectstorage` | Origin adapter over the object-storage gateway client: loads conditional on ETag. Safe only behind the consumer's own authorization check (see [Partitions](#partitions-and-authorization)). |
 
 Each directory under `go/` is its own module. This repository holds no backend
 code: an implementation depends on the interface, never the reverse. A provider
@@ -43,7 +43,10 @@ docs, err := cache.New(ctx,
     cache.WithOrigin(objectstorage.New(storageClient)), // or cache.SourceFunc for a query
     cache.WithStaleWindow(time.Hour),
 )
-doc, err := docs.Get(ctx, "reports/2026-09.json")
+// Only after the caller's own authorization check has passed. The partition
+// key comes from the verified Work Context; codefly's SDK derives it.
+p := cache.NewPartition(partitionKey)
+doc, err := docs.Get(ctx, p, "reports/2026-09.json")
 ```
 
 `cache.Open` takes anything with `Configuration(group, key)` and
@@ -53,22 +56,102 @@ a nil lookup (no provider in scope) it returns a `Memory` layer, so the same cod
 runs without a provider. Selecting the provider by interface rather than by
 service name waits on codefly-dev/core#655.
 
+## Partitions and authorization
+
+**The cache stores data, never decisions.** The authorization check runs on
+every read, before the stack is consulted, exactly as it would without a cache.
+A cache hit proves only that someone in the same partition loaded the value; it
+says nothing about whether this caller may read it. Partitioning prevents
+cross-viewer *data* leaks; it does not replace the check.
+
+The `objectstorage` source is the clearest case. It loads with whatever
+credential its gateway client is configured with. For a shared stack that must
+be the consumer's service credential: the gateway then answers for the service,
+and a stack over it returns any object to whoever asks with a valid partition,
+so it is only safe behind the consumer's own check of the caller against the
+object. A client whose per-call credentials come from the caller's context
+would, through a shared load, authorize every caller in the partition as the
+one whose request started the load (next paragraph).
+
+Every `Stack` operation takes a `Partition`:
+
+- `cache.NewPartition(key)` builds one from an opaque key the caller derives
+  from who is asking. It always names the tenant, and adds a digest of the
+  effective authorization view (scopes plus `authorization_revision`) when the
+  data itself varies by viewer (redaction, row filtering). It never includes
+  session or task ids: they carry no authorization meaning and would make every
+  read a miss. codefly's SDK derives the key from a verified Work Context; this
+  module never interprets identity and depends on neither core nor the SDK.
+- **An origin that reads the caller's identity makes the data vary by viewer.**
+  A load is shared by every caller in the partition and runs with the context
+  of the one that started it. If the origin authorizes or filters with that
+  context (per-call credentials, row-level security), every caller in the
+  partition receives what that one caller was allowed to see, errors and
+  "not found" included. Such an origin needs the authorization-view digest in
+  the key, not the tenant alone.
+- The stack prefixes every key with the partition in every layer. Values, fill
+  leases, negative entries, in-process fill-once and invalidation notices are
+  all scoped by it: two partitions never observe each other. Drivers are
+  unchanged; they never see a partition.
+- **A write reaches every partition.** Over an origin, each key has a
+  *generation*, a random token held in the layers under a key shared by all
+  partitions, and every partition's copy is stored under the current one. `Set`
+  and `Delete` write the origin, then they and `Invalidate` replace the
+  generation, so no partition reads a copy made before the write, and a
+  load that was running during it is stored where no read looks. A stack with
+  no origin holds each partition's own values, and its writes touch only the
+  caller's partition.
+- **Fail closed.** `Get`, `GetEntry`, `Set`, `Delete` and `Invalidate` with the
+  zero `Partition` (or an empty key) return `ErrNoPartition`. A stack that holds
+  data every caller may read opts out with `WithGlobal()` and passes
+  `cache.Global()`; each refuses the other (`ErrWrongPartition`), so the choice
+  is visible at construction and at every call site.
+- **Write-around.** `cache.NewPartition(key, cache.WriteAround())` marks work done
+  under an approval grant (codefly-dev/core#658). Its reads go to the origin
+  alone: they consult no layer, take no fill lease, share their load with no
+  other caller, and store nothing, found or not found. Its writes reach the
+  origin and replace the key's generation like any write. Without an origin a
+  write-around `Set` stores nothing and drops the partition's value.
+- **Revocation.** Because `authorization_revision` is part of the view digest,
+  a bump moves callers to a fresh partition, so no entry cached before it is
+  served after it. The cost: a bump makes that view's cache cold, and the old
+  partition's entries sit unused until their TTL.
+- **Cost.** Each partition holds its own copy of a key, and each key over an
+  origin one generation entry per layer, so a layer holds up to one copy per
+  view in use. Size `MaxEntries` (and the server's memory) for that: a busy
+  view evicts other tenants' entries sooner than when every viewer shared one
+  copy. A read looks up the generation, then the copy: two lookups, both in
+  the in-process tier when it holds them, two round trips when only the shared
+  layer does.
+
 ## Semantics
 
 - **Reads** walk the layers top-down and fill the ones above a hit, never
   fresher than the entry was below.
-- **Fill-once.** Concurrent misses in a process share one load (singleflight).
+- **Fill-once.** Concurrent misses for one key in one partition share one load
+  in a process (singleflight).
   Across processes, the deepest layer that is a `Leaser` (the most widely
-  shared) grants one fill lease; the others wait for that fill. A `Set` or `Delete` revokes an
-  outstanding lease, so a slow load cannot store a value older than the write.
+  shared) grants one fill lease; the others wait for that fill. A load that
+  was running when a write landed is stored under the generation the write
+  replaced, so it cannot bring back a value older than the write.
 - **Revalidation.** With `WithStaleWindow`, an expired entry that carries a
   version is reloaded conditionally; `ErrNotModified` renews it without moving
   the value.
 - **Writes.** Over a `Store` origin, `Set`/`Delete` write the origin, then
-  invalidate (default) or write through. Over a read-only origin they are
-  `ErrReadOnlyOrigin`. With no origin, the stack is a plain cache.
-- **Invalidation across processes.** A `Notifier` layer (Redis) reports keys
-  other processes changed, and the stack evicts them from the layers above it.
+  replace the key's generation; `WriteThrough` also stores the new value as the
+  writer's copy. Over a read-only origin they are `ErrReadOnlyOrigin`. With no
+  origin, the stack is a plain cache.
+- **Invalidation across processes.** A `Notifier` layer (optional) reports every
+  key that changed in it, by any writer: another process through its driver, a
+  client that bypasses the driver, or the server. The stack evicts the key,
+  generations included, from the layers above it. A Notifier may also report
+  its own client's writes; eviction is idempotent.
+- **Resync.** A Notifier either never loses a notice (Memory) or is a
+  `Resyncer`, which signals each gap in which notices may have been lost. On
+  the signal the stack flushes every layer above it, every partition and
+  generation alike, since it cannot know which keys changed; those layers must
+  be `Flusher`s (Memory is), or `New` refuses the stack. A fill whose read
+  began before the resync stores nothing in them.
 - **Degrade.** A failing layer is skipped behind a breaker; reads fall through
   to the next layer or the origin. `Invalidate` is always attempted and reports
   failures, because a missed invalidation serves stale data.
@@ -77,23 +160,45 @@ service name waits on codefly-dev/core#655.
 
 ### Limits, stated
 
-- Invalidation notices may be lossy (Redis pub/sub is): a missed notice leaves
-  the key in the layers above until their own TTL. Keep in-process TTLs short
-  relative to how stale a value may be.
 - Until the breaker opens (default 5 failures), each read pays the driver's
   timeouts and retries against an unreachable server; drivers document how to
   tune them.
-- Writes that bypass the stack reach cached copies only through TTL, or through
-  an explicit `Stack.Invalidate`.
+- Notices arrive after the write: until one arrives, the layers above keep
+  serving the old copy. Between a gap and its resync signal they may serve
+  copies of any key that changed during it. A Notifier that loses notices
+  without signalling breaks the contract, and leaves those copies until their
+  TTL.
+- Without a Notifier, layers above are bounded only by their TTL: keep
+  in-process TTLs short relative to how stale a value may be.
+- Writes to the origin that bypass the stack reach cached copies only through
+  TTL, or through an explicit `Stack.Invalidate`, which reaches every
+  partition.
+- Processes on different interface versions must not share a layer: they key
+  it differently, so neither invalidates the other's copies. Upgrade them
+  together, or point the new version at an empty keyspace.
 
 ## Versioning
 
 The interface version (`definition/cache.json`) moves only when the contract
-changes: the definition or the Go API that consumers and drivers share. A driver
-fix does not move it. Modules are tagged per path (`go/cache/vX.Y.Z`,
+changes: the definition, or the Go API consumers or drivers program against. A
+driver fix does not move it. A provider declares the interface version it
+serves, so a breaking move requires each provider to declare the new version,
+even when, as in 0.2.0, the configuration it emits is unchanged: a consumer
+that requires `^0.2` does not bind to a provider that still declares 0.1. Modules are tagged per path (`go/cache/vX.Y.Z`,
 `go/sources/objectstorage/vX.Y.Z`). `go.work` ties them together for development;
-a released module requires a tagged `go/cache`. A driver pins the `go/cache`
-version it implements.
+a released module requires a tagged `go/cache`. While a contract change is
+untagged, a module that needs it builds against it with a `replace` directive,
+dropped once `go/cache` is tagged. A driver pins the `go/cache` version it
+implements.
+
+0.2.0 is a breaking change: every `Stack` and `Typed` operation takes a
+`Partition`, the stack's keys in a layer change (see Limits), and `RunStack`
+gains the partition cases under a `Partitions` subtest. The Notifier contract
+changes: it reports changes by any writer, may report its own client's
+writes, and a Notifier that can lose notices must be a `Resyncer`. A driver
+whose notifications carry only what drivers publish (Redis pub/sub) no longer
+conforms. `Layer` and `Leaser` are unchanged; the Memory layer is also a
+`Flusher`.
 
 ## Test
 
