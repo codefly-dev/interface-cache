@@ -3,6 +3,9 @@ name: ci
 on:
   push:
     branches: [ main ]
+    # A vX.Y.Z tag publishes codefly.dev/cache@X.Y.Z; the definition module
+    # checks that the tag serves it.
+    tags: [ 'v*' ]
   pull_request:
     branches: [ main ]
 
@@ -18,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        module: [ go/cache, go/sources/objectstorage ]
+        module: [ definition, go/cache, go/sources/objectstorage ]
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -29,6 +32,10 @@ jobs:
       GOWORK: "off"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # definition reads the vX.Y.Z tags: each must serve the version its
+          # published/ directory records.
+          fetch-depth: 0
 
       # setup-go's cache corrupts the downloaded toolchain module on restore;
       # the fleet's shared Go workflow disables it for the same reason.

@@ -1,0 +1,18 @@
+# codefly.dev/cache 0.1.0 as it was published, provisionally, in
+# definition/cache.json at go/cache/v0.1.0, carried into core's format. It
+# predates interface.codefly.yaml and was never served at a v0.1.0 tag.
+kind: interface
+publisher: codefly.dev
+name: cache
+version: 0.1.0
+type: capability
+description: >-
+    A key-value cache layer with TTL, fill leases and invalidation, consumed
+    through a library driver. A provider service emits this configuration
+    group; a consumer opens the named driver with it.
+capability:
+    configuration: cache
+    keys:
+        - name: driver
+        - name: connection
+          secret: true

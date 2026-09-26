@@ -1,7 +1,8 @@
 # Working in codefly-dev/interface-cache
 
 This repo owns the `codefly.dev/cache` interface: the published definition
-(`definition/cache.json`), the Go library (`go/cache`), origin adapters
+(`interface.codefly.yaml`, in core's format, held to core's checks by the
+`definition` module), the Go library (`go/cache`), origin adapters
 (`go/sources/*`) and the conformance suite (`go/cache/cachetest`). It holds no
 backend code. `README.md` is the reference for semantics and limits.
 
@@ -12,7 +13,11 @@ It does **not** own:
   Redis, emits the `cache` group and ships the Redis driver
   (`github.com/codefly-dev/service-redis/cache`), proven with `cachetest`;
 - the data services used as origins: `service-object-storage` stays unaware of
-  caching.
+  caching;
+- the `InterfaceResolver` that fetches the definition: that is the CLI
+  (codefly-dev/cli#833 §3, owned by the session that owns core's release). This
+  repository only fixes where it fetches from: `interface.codefly.yaml` at the
+  repository root at the tag `vX.Y.Z` for `codefly.dev/cache@X.Y.Z`.
 
 ## How to behave
 
@@ -31,7 +36,8 @@ Fleet standard: [handbook#68](https://github.com/obin-ai/handbook/issues/68).
 
 ## Build and test
 
-Each `go/*` directory is its own module; `go.work` ties them together locally.
+Each `go/*` directory, and `definition`, is its own module; `go.work` ties them
+together locally.
 CI (`.github/workflows/ci.yml`) checks each module with `GOWORK=off`, as a
 consumer would:
 
@@ -57,9 +63,30 @@ Keep `-timeout 30m`: the first run installs the object-storage gateway.
   shared layer also grants leases, but only inside one process;
   `TestMemoryStackFillOnce` fails if the stack leases on the top layer.
 - **The definition and the Go constants must agree.**
-  `TestConstantsMatchPublishedDefinition` enforces it. Change them together, and
-  bump the interface version when the contract changes. A driver fix does not
-  bump the interface version.
+  `TestConstantsMatchPublishedDefinition`, in `definition`, enforces it. Change
+  them together, and bump the interface version when the contract changes. A
+  driver fix does not bump the interface version.
+- **The definition is core's format and nothing else.** Core's loader decodes
+  it strictly, so it carries only what core defines: no drivers, no per-key
+  descriptions (those are in the README). Never check it with a parser of our
+  own; `definition` uses core's loader, `ValidateProvidedConfiguration`,
+  `EvolveInterface` and `SemanticReport.AddInterfaceEvolutions`. If core cannot
+  express something the contract needs, file it on core.
+- **A published version is never edited.** A version bump adds
+  `definition/published/X.Y.Z/`, identical to the root file
+  (`TestRootIsTheNewestPublishedVersion`), and core's evolution check runs from
+  each published version to the next. Never weaken a case in
+  `TestBreakingChangeCannotBeReleasedAsCompatible` to let a bump through: bump
+  the version the check asks for. The check is structural; a behavioural break
+  with an unchanged group still needs the breaking bump, by judgement.
+- **A bare `vX.Y.Z` tag is an interface version.** Cut it on `main` after the
+  PR that publishes `X.Y.Z` merges; CI (`TestTagsServeTheirPublishedVersion`)
+  holds every `v*` tag to its `published/` directory. Go modules are tagged
+  under their paths, and `definition` is never tagged.
+- **The conformance fixture follows service-redis.** `emitted` in
+  `definition/conformance_test.go` is what service-redis's
+  `CreateConnectionConfiguration` returns, commit named. When service-redis
+  changes what it emits, update it from there, never to make a check pass.
 - **The gateway version in `go/sources/objectstorage/go.mod` follows
   `service-object-storage` releases.** Move it with them.
 - **Partitioning lives in the Stack, never in a driver.** `Partition.layerKey`
@@ -87,9 +114,13 @@ Keep `-timeout 30m`: the first run installs the object-storage gateway.
   That is what keeps a slow load from caching a value older than the write.
 - **Keep `go/cache` dependency-free.** Anything backend-specific goes in its own
   module. It never imports core or the SDK: a partition key is opaque here.
+  What needs core goes in `definition`.
 - **An untagged contract change reaches the other modules by `replace`.** A
   module that needs it points at `../../cache` until `go/cache` is tagged; the
   release then tags `go/cache/vX.Y.Z`, requires it and drops the `replace`.
+  The exception is `definition`: nothing imports it, and its constants test
+  must compare the definition with the `go/cache` of the same commit, so its
+  `replace ../go/cache` is permanent.
 
 ## Workflow
 

@@ -1,0 +1,21 @@
+kind: interface
+publisher: codefly.dev
+name: cache
+version: 0.2.0
+type: capability
+description: >-
+    A key-value cache layer with TTL, fill leases and invalidation, consumed
+    through a library driver. A provider service emits this configuration
+    group; a consumer opens the named driver with it (driver: the name the
+    driver registers with cache.Register, e.g. "redis"; connection: the
+    driver-specific connection string, for "redis" a redis:// or rediss:// URL).
+    Every stack operation is scoped to a caller-supplied partition; drivers
+    store the keys the stack hands them and never see a partition. A driver's
+    optional notifications report every change to a key, by any writer, and a
+    driver that can lose notifications signals each gap so consumers resync.
+capability:
+    configuration: cache
+    keys:
+        - name: driver
+        - name: connection
+          secret: true

@@ -1,6 +1,7 @@
 go 1.27.0
 
 use (
+	./definition
 	./go/cache
 	./go/sources/objectstorage
 )

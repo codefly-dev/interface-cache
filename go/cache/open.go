@@ -9,7 +9,7 @@ import (
 )
 
 // The configuration a provider of codefly.dev/cache emits, as fixed by the
-// published definition (definition/cache.yaml at the repository root).
+// published definition (interface.codefly.yaml at the repository root).
 const (
 	// Group is the configuration group a provider emits.
 	Group = "cache"
@@ -79,7 +79,7 @@ func Open(ctx context.Context, lookup Lookup) (Layer, error) {
 	registryMu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("cache: provider names driver %q, which is not registered (registered: %s); "+
-			"blank-import the driver package its provider ships (listed under drivers in the codefly.dev/cache definition)",
+			"blank-import the driver package its provider ships (the interface-cache README lists them)",
 			driver, registered())
 	}
 	return open(ctx, Config{Driver: driver, Connection: connection})
