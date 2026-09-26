@@ -3,7 +3,7 @@ module github.com/codefly-dev/interface-cache/go/sources/objectstorage
 go 1.27.0
 
 require (
-	github.com/codefly-dev/interface-cache/go/cache v0.0.0
+	github.com/codefly-dev/interface-cache/go/cache v0.1.0
 	github.com/codefly-dev/service-object-storage v0.0.12
 	google.golang.org/grpc v1.83.2
 )
