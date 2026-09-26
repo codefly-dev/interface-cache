@@ -44,8 +44,9 @@ var (
 	registry   = map[string]Opener{}
 )
 
-// Register makes a driver available to Open under name. Drivers call it from
-// init, so a consumer enables one with a blank import. Registering a name
+// Register makes a driver available to Open under name. Drivers live with the
+// service that provides them and call it from init, so a consumer enables one
+// with a blank import. Registering a name
 // twice panics.
 func Register(name string, open Opener) {
 	registryMu.Lock()
@@ -78,8 +79,9 @@ func Open(ctx context.Context, lookup Lookup) (Layer, error) {
 	open, ok := registry[driver]
 	registryMu.RUnlock()
 	if !ok {
-		return nil, fmt.Errorf("cache: provider names driver %q, which is not registered (registered: %s); import it, e.g. _ \"github.com/codefly-dev/interface-cache/go/%s\"",
-			driver, registered(), driver)
+		return nil, fmt.Errorf("cache: provider names driver %q, which is not registered (registered: %s); "+
+			"blank-import the driver package its provider ships (listed under drivers in the codefly.dev/cache definition)",
+			driver, registered())
 	}
 	return open(ctx, Config{Driver: driver, Connection: connection})
 }

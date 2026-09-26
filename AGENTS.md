@@ -1,14 +1,16 @@
 # Working in codefly-dev/interface-cache
 
-This repo owns the `codefly.dev/cache` interface end to end: the published
-definition (`definition/cache.json`), the Go library (`go/cache`), every driver
-(`go/redis`), origin adapters (`go/sources/*`) and the conformance suite
-(`go/cache/cachetest`). `README.md` is the reference for semantics and limits.
+This repo owns the `codefly.dev/cache` interface: the published definition
+(`definition/cache.json`), the Go library (`go/cache`), origin adapters
+(`go/sources/*`) and the conformance suite (`go/cache/cachetest`). It holds no
+backend code. `README.md` is the reference for semantics and limits.
 
 It does **not** own:
 - the generic `Interface` type and its checks: that is `codefly-dev/core`, which
   must never carry this interface's details;
-- the servers: `service-redis` runs Redis and emits the `cache` group;
+- drivers: each lives with the service that provides it. `service-redis` runs
+  Redis, emits the `cache` group and ships the Redis driver
+  (`github.com/codefly-dev/service-redis/cache`), proven with `cachetest`;
 - the data services used as origins: `service-object-storage` stays unaware of
   caching.
 
@@ -23,9 +25,7 @@ Fleet standard: [handbook#68](https://github.com/obin-ai/handbook/issues/68).
   provider's configuration via `cache.Open`. Do not parse codefly's environment
   encoding; `Lookup` exists so the SDK owns that.
 - **Diagnose, do not pattern-match.** A lease or invalidation bug that "went
-  away" has not been fixed until a conformance test fails without the fix. The
-  suite is known to catch a missing lease check in `fillScript`: removing it
-  fails `DeleteRevokesLease`, `SetRevokesLease` and `LeaseExpires`.
+  away" has not been fixed until a conformance test fails without the fix.
 - **Say what you did not verify.** Name the modules and servers you actually
   ran against.
 
@@ -40,26 +40,25 @@ go build ./... && go vet ./... && go mod tidy -diff
 go test -race -count=1 -v -timeout 30m ./...
 ```
 
-Keep `-timeout 30m`: the first run pulls the Redis image and installs the
-object-storage gateway.
+Keep `-timeout 30m`: the first run installs the object-storage gateway.
 
 ## Rules that bite
 
-- **Do not mock a server.** Driver behaviour is proven by `cachetest` against a
-  real server: Redis from `service-redis`'s pinned image, the gateway at the
-  pinned module version. `CACHE_INFRA_TESTS=required` turns a missing server
-  into a failure; a green run without it may have skipped.
+- **Do not mock a server.** Drivers prove themselves with `cachetest` in their
+  own repository, against the server their agent runs. The object-storage
+  adapter here runs against the real gateway at its pinned module version.
+- **This repo's CI does not exercise the Leaser/Notifier half of `cachetest`**:
+  no in-repo layer implements them. A change to the lease or notification
+  contract must be run against `service-redis/cache` before it merges.
 - **The definition and the Go constants must agree.**
   `TestConstantsMatchPublishedDefinition` enforces it. Change them together, and
   bump the interface version when the contract changes. A driver fix does not
   bump the interface version.
-- **Two pins are copies of other repos' pins.** `redisImage` in
-  `go/redis/redis_test.go` mirrors `service-redis/runtime-image.json`, and the
-  gateway version in `go/sources/objectstorage/go.mod` follows
-  `service-object-storage` releases. Move them together with their source.
+- **The gateway version in `go/sources/objectstorage/go.mod` follows
+  `service-object-storage` releases.** Move it with them.
 - **A lease is revoked by any write.** `Set`, `Delete` and expiry must all make
-  a later `Fill` return `ErrLeaseLost`. That is what keeps a slow load from
-  caching a value older than the write.
+  a later `Fill` return `ErrLeaseLost`; `cachetest` holds every driver to it.
+  That is what keeps a slow load from caching a value older than the write.
 - **Keep `go/cache` dependency-free.** Anything backend-specific goes in its own
   module.
 

@@ -373,8 +373,8 @@ func TestOpen(t *testing.T) {
 	}
 
 	_, err = cache.Open(ctx, lookup{"cache.driver": "nosuch", "cache.connection": "x"})
-	if err == nil || !strings.Contains(err.Error(), `_ "github.com/codefly-dev/interface-cache/go/nosuch"`) {
-		t.Fatalf("unregistered driver error = %v, want a hint naming the import", err)
+	if err == nil || !strings.Contains(err.Error(), `driver "nosuch", which is not registered`) || !strings.Contains(err.Error(), "blank-import") {
+		t.Fatalf("unregistered driver error = %v, want the driver named and how to register it", err)
 	}
 
 	if _, err := cache.Open(ctx, lookup{"cache.driver": "opentest", "cache.connection": "conn://x"}); err != nil {

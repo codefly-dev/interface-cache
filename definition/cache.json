@@ -22,7 +22,7 @@
   },
   "drivers": {
     "redis": {
-      "go": "github.com/codefly-dev/interface-cache/go/redis"
+      "go": "github.com/codefly-dev/service-redis/cache"
     }
   }
 }
