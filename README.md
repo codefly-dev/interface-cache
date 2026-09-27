@@ -267,7 +267,7 @@ revalidation or write that last vouched for it, on the reader's clock plus
 | `WriteInvalidate()` | Writes the origin, then replaces the key's generation in every layer: no partition reads a copy made before the write. | — | `Modes/Write/Invalidate` |
 | `WriteThrough()` | `WriteInvalidate`, then stores the new value as the writer's copy, so its next read is a hit. The copy is made after a conditional load of the version the origin returned, so a write that landed in between is never overwritten by this one. | — | `Modes/Write/Through` |
 | `WriteOriginOnly()` | Writes the origin and touches no layer: copies catch up through their freshness mode. | an origin; refused with `InvalidateOnWrite` | `Modes/Write/OriginOnly` |
-| `WriteBehind(cache.AcceptWriteLoss)` | Stores the value as the writer's copy and acknowledges, then writes the origin in the background. Until it lands, the writing process reads its own pending write in the writing partition and everyone else reads the origin; once it lands the generation is replaced again. **Loses the write if the process dies first**, hence the required acknowledgement. `Stack.Drain` waits for the queue and returns the writes dropped after five refusals (also reported to `WithWriteBehindErrors`); `Stack.Close` does not wait. | a `Store` origin | `Modes/Write/Behind` |
+| `WriteBehind(cache.AcceptWriteLoss)` | Stores the value as the writer's copy and acknowledges, then writes the origin in the background. Until it lands, the writing process reads its own pending write in the writing partition and everyone else reads the origin; once it lands the generation is replaced again. **Loses the write if the process dies first**, hence the required acknowledgement. At most `WithWriteBehindQueue` writes (default 10,000) may be waiting; past that a write is refused with `ErrWriteBehindFull` rather than acknowledged, so an origin that stops accepting writes surfaces as an error the caller can act on instead of a queue that grows until the process dies with every write in it. `Stack.Drain` waits for the queue and returns every dropped write — refused five times, or still queued at `Stack.Close` — each also reported to `WithWriteBehindErrors`; `Stack.Close` does not wait. | a `Store` origin | `Modes/Write/Behind` |
 
 A write the origin took while a layer missed the invalidation returns
 `ErrPartialWrite`; the stack does not read that layer again until the
@@ -306,7 +306,8 @@ settings, err := cache.New(ctx,
     // Per stack: the default for every key.
     cache.WithMode(cache.InvalidateOnWrite(), cache.FillLease()),
     // Per key space: a pattern ending in "*" is a prefix, any other one key;
-    // the longest matching pattern wins.
+    // the longest matching pattern wins, and an exact pattern beats a prefix
+    // of the same length whichever was registered first.
     cache.WithKeySpace("org-settings/*", cache.Validated()),
     cache.WithKeySpace("avatars/*", cache.TTLBounded(time.Hour)),
 )
@@ -365,7 +366,7 @@ cache: New: key space "org-settings/*": cache: mode not supported by this stack:
 | `Validated` | no origin, or one that does not declare `ConditionalLoads` |
 | `StaleWhileRevalidate`, `Bypass`, `WriteOriginOnly` | no origin |
 | `ReadYourWrites` | an origin that is not a `Store` |
-| `WriteBehind` | no origin, or one that is not a `Store` |
+| `WriteBehind` | no origin, or one that is not a `Store`; a write past `WithWriteBehindQueue` is refused with `ErrWriteBehindFull` |
 | `TTLBounded(d)`, `StaleWhileRevalidate(d)` | `d` not positive |
 | a layer or origin | it declares a capability it does not implement, `Resyncs` or a `NoticeBound` without `Notifies` |
 
@@ -378,7 +379,7 @@ suite. Each states the modes it applies to and the correct outcome under each.
 | Scenario | Correct outcome |
 |---|---|
 | `StaleSet`: a slow load stores an old value after a newer write | A write through a stack, any mode: never, since the load is stored under the generation the write replaced. A write around every stack: `FillVersionFenced` refuses the older fill; other fills store it and serve it until the mode's freshness bound. |
-| `StaleRefillAfterInvalidation` (module-saas-starter#942, F2): a process reads a key's old generation from the shared layer, a notice for it arrives while its own tier is still empty, then it stores what it read | Every mode: the store is undone. A notice or local write between a fill's read of a lower tier and its store into an upper one voids the store, for generations and copies alike (a per-key notice epoch checked by each fill). |
+| `StaleRefillAfterInvalidation` (module-saas-starter#942, F2): a process reads a key's old generation from the shared layer, a notice for it arrives while its own tier is still empty, then it stores what it read | Every mode: the store is undone. A notice or local write between a fill's read of a lower tier and its store into any tier voids the store, for generations and copies alike. A write or a notice voids the fills of that key alone: the stack tracks the operations in flight per cache key exactly, so writes to other keys never discard a fill. A voided store that the layer refuses to delete quarantines the tier, as a missed invalidation does. |
 | `ReplicaRefill`: a reader refills its in-memory tier from a shared layer that has not caught up | Default and `InvalidateOnWrite`: once the write's notice reached the reader, it serves the write. Holds through a replica only when notices come from the server the reads do; `ReadYourWrites` holds it for the writer whatever the replica. |
 | `Invalidations`: lost, delayed, reordered or duplicated notices | Lost inside a reported gap: nothing from the layers above is served during it, nor anything they held after it. Delayed: a copy is served until the notice lands (`InvalidateOnWrite`'s bound). Reordered or duplicated: harmless, a notice only evicts. A delete twice: no error, not found. |
 | `Stampede`: hot key, mass expiry, missing-key penetration | `FillUncoordinated` loads once per miss, `FillSingleflight` once per process, `FillLease` once across processes. With TTL jitter `f`, copies filled together expire over `[(1-f)·TTL, TTL]`. A missing key loads the origin once per negative TTL. |
@@ -463,6 +464,11 @@ last 60.
   until the invalidation is replayed there.
 - **Negative caching.** An origin's `ErrNotFound` is cached for
   `WithNegativeTTL` (default 5s; 0 disables).
+- **Fill leases outlive the load they guard.** `WithLeaseTTL` defaults to
+  `WithLoadTimeout` (30s), which bounds that load. A lease shorter than the load
+  is not a smaller optimisation: a fill whose lease expired first is stored in
+  no tier at all, so while loads stay slower than the lease the key is never
+  cached by any process and every read reaches the origin.
 
 ### Limits, stated
 
@@ -482,7 +488,9 @@ last 60.
   partition), or an origin that declares `ChangeFeed`
   (`Pitfalls/OutOfBandOriginWrites` measures each).
 - `WriteBehind` loses an acknowledged write when the process dies before the
-  origin takes it. `Stack.Drain` before shutdown; `Stack.Close` does not wait.
+  origin takes it. `Stack.Drain` before shutdown; `Stack.Close` does not wait,
+  but it does report every write it abandons, through `Stack.Drain`'s error and
+  `WithWriteBehindErrors`.
 - A `Validated` read costs one origin round trip even on a hit; a hot key read
   that way puts its full read rate on the origin (see
   [Benchmarks](#benchmarks)).
@@ -542,7 +550,8 @@ conforms. `Layer` and `Leaser` are unchanged; the Memory layer is also a
   `Declarer`, with `New` refusing a mode the declarations cannot keep
   (`ErrUnsupportedMode`); `Fencer`, `ChangeFeed`, `ErrFenced`,
   `ErrUnavailable`, `ErrPartialWrite`; `WithSchema`, `WithClock`,
-  `WithClockSkew`, `WithExecutor`, `WithWriteBehindErrors`, `Stack.Drain`;
+  `WithClockSkew`, `WithExecutor`, `WithWriteBehindErrors`,
+  `WithWriteBehindQueue` (`ErrWriteBehindFull`), `Stack.Drain`;
   `Memory`'s byte budget (`MaxBytes`, default 64 MiB) and fenced fills; the
   `Modes`, `Pitfalls` and `Simulation` cases of `RunStack`, and `Simulate`.
 - **Breaking, for consumers:** fills are leased across processes only under

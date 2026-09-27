@@ -155,7 +155,11 @@ func WriteOriginOnly() WritePropagation { return PropagateOriginOnly }
 
 // WriteBehind is PropagateBehind. It is opt-in by name: pass AcceptWriteLoss,
 // since a write acknowledged but not yet written to the origin is lost when
-// the process dies. Stack.Drain waits for the queue; Stack.Close does not.
+// the process dies. Stack.Drain waits for the queue; Stack.Close does not, and
+// reports every write it abandons through Drain's error and
+// WithWriteBehindErrors. At most WithWriteBehindQueue writes may be waiting:
+// past that a write is refused with ErrWriteBehindFull rather than
+// acknowledged, so a stalled origin cannot grow the queue without bound.
 //
 // Until the origin has it, the writing process reads its own pending write in
 // the writing partition (except with Bypass, which reads the origin);

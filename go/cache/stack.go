@@ -50,6 +50,8 @@ type Stack struct {
 	skew            time.Duration
 	run             func(task func())
 	behindErrors    func(key string, err error)
+	behindQueue     int
+	leaseTTLSet     bool // WithLeaseTTL was given, so it does not follow loadTimeout
 	// mint is how a missing generation is minted: with a lease when a tier
 	// grants them, fenced when every tier fences, else unguarded.
 	mint FillCoordination
@@ -62,22 +64,19 @@ type Stack struct {
 	resyncMu sync.RWMutex
 	resyncs  uint64
 
-	// notices and writes count, per bucket of cache keys, the notices and
-	// the local writes that touched any of their layer keys. A fill that read
-	// below while its key's count moved undoes what it stored: the notice or
-	// write may have landed first. A notice only concerns the tiers above
-	// its notifier; a local write, every tier.
-	notices [epochBuckets]atomic.Uint64
-	writes  [epochBuckets]atomic.Uint64
+	// inflight holds the operations running right now, per cache key. A local
+	// write or a notice voids the ones racing it, and a fill that read below
+	// while its key was written or noticed undoes what it stored: the write or
+	// notice may have landed first. A notice only concerns the tiers above its
+	// notifier; a local write, every tier.
+	inflight inflight
 
 	modesMu sync.Mutex
-	modes   map[Mode]error // per-call modes checked so far
+	modes   map[modeKey]struct{} // per-call modes checked and supported so far
 
 	own    ownWrites
 	behind writeBehind
 }
-
-const epochBuckets = 4096
 
 type tier struct {
 	layer   Layer
@@ -194,15 +193,18 @@ func WithNegativeTTL(d time.Duration) Option {
 	return func(s *Stack) error { s.negativeTTL = d; return nil }
 }
 
-// WithLeaseTTL sets how long a fill lease is held on a shared layer. It should
-// exceed the origin's load time: a fill that outlives its lease is not cached.
-// Default 5s.
+// WithLeaseTTL sets how long a fill lease is held on a shared layer. It must
+// exceed the origin's load time: a fill whose lease expired first is stored
+// nowhere, in any tier, so while every load takes longer than this the key is
+// never cached by any process and every read reaches the origin — the stampede
+// FillLease exists to prevent. Default: WithLoadTimeout, which bounds that
+// load, so the lease outlives it by construction.
 func WithLeaseTTL(d time.Duration) Option {
 	return func(s *Stack) error {
 		if d <= 0 {
 			return fmt.Errorf("cache: WithLeaseTTL: must be positive, got %s", d)
 		}
-		s.leaseTTL = d
+		s.leaseTTL, s.leaseTTLSet = d, true
 		return nil
 	}
 }
@@ -306,11 +308,33 @@ func WithExecutor(run func(task func())) Option {
 	}
 }
 
-// WithWriteBehindErrors reports each WriteBehind write the origin refused five
-// times in a row and that was dropped. Stack.Drain also returns them.
+// WithWriteBehindErrors reports each WriteBehind write that was dropped: one
+// the origin refused five times in a row, and one still queued when the stack
+// was closed without a Drain. Stack.Drain also returns them.
 func WithWriteBehindErrors(fn func(key string, err error)) Option {
 	return func(s *Stack) error { s.behindErrors = fn; return nil }
 }
+
+// WithWriteBehindQueue bounds how many WriteBehind writes may be waiting for
+// the origin. Past it, Set and Delete return ErrWriteBehindFull rather than
+// acknowledge a write the queue cannot hold: an origin that stops accepting
+// writes then shows up as a refusal the caller can act on, instead of a queue
+// that grows until the process dies and loses all of it. Default 10,000.
+func WithWriteBehindQueue(writes int) Option {
+	return func(s *Stack) error {
+		if writes < 1 {
+			return fmt.Errorf("cache: WithWriteBehindQueue: must be at least 1, got %d", writes)
+		}
+		s.behindQueue = writes
+		return nil
+	}
+}
+
+// ErrWriteBehindFull is returned by a WriteBehind write when the queue waiting
+// for the origin is at its bound (WithWriteBehindQueue). The write did not
+// happen: the caller may retry it, or write it through synchronously with
+// WriteInvalidate.
+var ErrWriteBehindFull = errors.New("cache: the write-behind queue is full")
 
 // New builds a stack. It needs at least one layer or an origin. It refuses
 // every mode — the default, and each key space's — that the layers' and the
@@ -320,14 +344,14 @@ func WithWriteBehindErrors(fn func(key string, err error)) Option {
 func New(ctx context.Context, opts ...Option) (*Stack, error) {
 	s := &Stack{
 		negativeTTL:     5 * time.Second,
-		leaseTTL:        5 * time.Second,
 		loadTimeout:     30 * time.Second,
 		jitter:          0.1,
 		breakerFailures: 5,
 		breakerCooldown: 10 * time.Second,
+		behindQueue:     10_000,
 		clock:           systemClock{},
 		run:             func(task func()) { go task() },
-		modes:           map[Mode]error{},
+		modes:           map[modeKey]struct{}{},
 	}
 	for _, opt := range opts {
 		if err := opt(s); err != nil {
@@ -336,6 +360,12 @@ func New(ctx context.Context, opts ...Option) (*Stack, error) {
 	}
 	if len(s.tiers) == 0 && s.origin == nil {
 		return nil, errors.New("cache: New: a stack needs at least one tier or an origin")
+	}
+	if !s.leaseTTLSet {
+		// A lease shorter than the load it guards caches nothing at all, so
+		// the default follows the bound on that load rather than a constant
+		// that happens to be shorter than it.
+		s.leaseTTL = s.loadTimeout
 	}
 	for i, t := range s.tiers {
 		t.caps = CapabilitiesOf(t.layer)
@@ -366,7 +396,7 @@ func New(ctx context.Context, opts ...Option) (*Stack, error) {
 		s.Close()
 		return nil, err
 	}
-	s.behind.init()
+	s.behind.init(s.behindQueue)
 	return s, nil
 }
 
@@ -387,7 +417,21 @@ func (s *Stack) resolveModes() error {
 		s.noteSWR(k.mode)
 		s.spaces = append(s.spaces, k)
 	}
-	slices.SortStableFunc(s.spaces, func(a, b keySpace) int { return len(b.pattern) - len(a.pattern) })
+	// Longest pattern first, and an exact pattern ahead of a prefix pattern of
+	// the same length: "user:1234" is more specific than "user:1234*" for the
+	// key "user:1234", so which one was registered first must not decide it.
+	slices.SortStableFunc(s.spaces, func(a, b keySpace) int {
+		if n := len(b.pattern) - len(a.pattern); n != 0 {
+			return n
+		}
+		switch {
+		case !a.prefix && b.prefix:
+			return -1
+		case a.prefix && !b.prefix:
+			return 1
+		}
+		return 0
+	})
 	return nil
 }
 
@@ -447,7 +491,7 @@ func (s *Stack) subscribe(ctx context.Context) error {
 	}
 	if s.originCaps.ChangeFeed {
 		stop, err := s.origin.(ChangeFeed).SubscribeChanges(ctx, func(key string) {
-			_, _ = s.bump(context.Background(), key, FailDegrade)
+			_, _ = s.bump(context.Background(), key)
 		})
 		if err != nil {
 			return fmt.Errorf("cache: subscribe to the origin's changes: %w", err)
@@ -506,28 +550,107 @@ func (s *Stack) since() uint64 {
 	return s.resyncs
 }
 
-// bucket is the epoch bucket of the cache key layerKey belongs to. It is keyed
-// by the cache key, not the layer key, so every partition and generation of a
-// key share it, and so that which fills a collision undoes does not depend on
-// the random generation tokens: a run replays exactly.
-func bucket(layerKey string) uint64 {
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(keyOf(layerKey)))
-	return h.Sum64() % epochBuckets
+// inflight tracks the operations running right now for each cache key: fills
+// waiting on a lower tier or the origin, and writes storing down the stack. A
+// local write or a notice for a key voids exactly the operations racing it,
+// which then undo what they stored.
+//
+// It is keyed by the cache key, not the layer key, so every partition and
+// generation of a key share an entry: a write bumps the key's generation, which
+// orphans every partition's copies, so every partition's racing fill must see
+// it. Keying it exactly — rather than hashing the key into a fixed set of
+// counters — is what keeps a write to one key from voiding an unrelated key's
+// fill. The map holds only what is in flight, so it is bounded by concurrency
+// and not by the key space.
+type inflight struct {
+	shards [inflightShards]inflightShard
 }
 
-// noticed records that a notice named layerKey, for fills racing it.
-func (s *Stack) noticedEpoch(layerKey string) { s.notices[bucket(layerKey)].Add(1) }
+const inflightShards = 64
 
-// touch records that a local write changed layerKey, for fills racing it.
-func (s *Stack) touch(layerKey string) { s.writes[bucket(layerKey)].Add(1) }
+type inflightShard struct {
+	mu  sync.Mutex
+	ops map[string]map[*operation]struct{}
+}
 
-// epoch is layerKey's notice and write counts.
-type epoch struct{ notices, writes uint64 }
+// operation is one fill or one write in flight for a cache key. A write or a
+// notice for that key sets the matching flag on every operation but its own.
+// The flags are sticky from begin to end, so an operation sees every change
+// that raced any part of it.
+type operation struct {
+	key     string
+	writes  atomic.Bool
+	notices atomic.Bool
+}
 
-func (s *Stack) epochOf(layerKey string) epoch {
-	b := bucket(layerKey)
-	return epoch{s.notices[b].Load(), s.writes[b].Load()}
+func (i *inflight) shard(key string) *inflightShard {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(key))
+	return &i.shards[h.Sum64()%inflightShards]
+}
+
+// begin registers an operation on cacheKey. Every begin is paired with an end.
+func (i *inflight) begin(cacheKey string) *operation {
+	op := &operation{key: cacheKey}
+	sh := i.shard(cacheKey)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if sh.ops == nil {
+		sh.ops = map[string]map[*operation]struct{}{}
+	}
+	ops := sh.ops[cacheKey]
+	if ops == nil {
+		ops = map[*operation]struct{}{}
+		sh.ops[cacheKey] = ops
+	}
+	ops[op] = struct{}{}
+	return op
+}
+
+// end deregisters op, dropping the key's entry once nothing is in flight for
+// it, so the map never outgrows the work actually running.
+func (i *inflight) end(op *operation) {
+	if op == nil {
+		return
+	}
+	sh := i.shard(op.key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	ops := sh.ops[op.key]
+	delete(ops, op)
+	if len(ops) == 0 {
+		delete(sh.ops, op.key)
+	}
+}
+
+// mark voids every operation in flight for cacheKey except self, which is the
+// operation doing the writing (nil for a notice, which is nobody's operation).
+func (i *inflight) mark(cacheKey string, self *operation, notice bool) {
+	sh := i.shard(cacheKey)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	for op := range sh.ops[cacheKey] {
+		if op == self {
+			continue
+		}
+		// An atomic store, so the flags are set under the shard lock rather
+		// than copied out first: a write must not allocate to mark a key.
+		if notice {
+			op.notices.Store(true)
+		} else {
+			op.writes.Store(true)
+		}
+	}
+}
+
+// noticedEpoch records that a notice named layerKey, voiding the fills racing
+// it.
+func (s *Stack) noticedEpoch(layerKey string) { s.inflight.mark(keyOf(layerKey), nil, true) }
+
+// touch records that a local write is changing layerKey, voiding the fills
+// racing it. self is the writing operation, which it leaves alone.
+func (s *Stack) touch(layerKey string, self *operation) {
+	s.inflight.mark(keyOf(layerKey), self, false)
 }
 
 // Close stops the stack's invalidation subscriptions. It does not close the
@@ -555,16 +678,45 @@ func (s *Stack) Mode(key string, opts ...ModeOption) (Mode, error) {
 		return m, nil
 	}
 	m = m.with(opts)
+	k := modeKeyOf(m)
 	s.modesMu.Lock()
-	err, checked := s.modes[m]
+	_, checked := s.modes[k]
 	s.modesMu.Unlock()
-	if !checked {
-		err = s.supports(m)
-		s.modesMu.Lock()
-		s.modes[m] = err
-		s.modesMu.Unlock()
+	if checked {
+		return m, nil
 	}
-	return m, err
+	if err := s.supports(m); err != nil {
+		// Refusals are not cached: their message quotes the bound the caller
+		// passed, so one mode's refusal must never be handed to another's.
+		return m, err
+	}
+	s.modesMu.Lock()
+	s.modes[k] = struct{}{}
+	s.modesMu.Unlock()
+	return m, nil
+}
+
+// modeKey is a Mode reduced to what supports decides on: the freshness kind and
+// whether its bound is positive — the bound's value is only ever tested for
+// that — plus the other three dimensions. Keying the cache of checked modes by
+// this keeps it to a few hundred entries at most, so a caller passing a
+// per-request TTLBounded(d) cannot grow it for the life of the stack.
+type modeKey struct {
+	kind     freshnessKind
+	positive bool
+	write    WritePropagation
+	fill     FillCoordination
+	failure  FailurePolicy
+}
+
+func modeKeyOf(m Mode) modeKey {
+	return modeKey{
+		kind:     m.Freshness.kind,
+		positive: m.Freshness.bound > 0,
+		write:    m.Write,
+		fill:     m.Fill,
+		failure:  m.Failure,
+	}
 }
 
 // Get returns the value for key in partition p. It is ErrNotFound when the
@@ -610,13 +762,16 @@ func (s *Stack) GetEntry(ctx context.Context, p Partition, key string, opts ...M
 	// resync may be one the resync exists to drop.
 	since := s.since()
 	if s.origin == nil {
-		return s.read(ctx, m, s.newFill(p.layerKey(s.schema, key), since, m.Fill))
+		f := s.newFill(p.layerKey(s.schema, key), since, m.Fill)
+		defer s.done(f)
+		return s.read(ctx, m, f)
 	}
 	generation, err := s.generation(ctx, m, since, key)
 	if err != nil {
 		return Entry{}, err
 	}
 	f := s.newFill(p.entryKey(s.schema, generation, key), since, m.Fill)
+	defer s.done(f)
 	f.load = func(ctx context.Context, ifNot string) (Entry, error) { return s.origin.Load(ctx, key, ifNot) }
 	if m.Freshness.kind == freshValidated {
 		return s.validated(ctx, m, f)
@@ -655,9 +810,10 @@ type fill struct {
 	// since is the resync count when the operation began; what it found must
 	// not be stored into a flushed tier after a later resync.
 	since uint64
-	// epoch is layer's notice and write counts when the read began; a store
-	// made after they moved is undone.
-	epoch epoch
+	// op is this fill's registration in the stack's in-flight set, for the
+	// span it may read a stale value over: a store made after a write or a
+	// notice voided it is undone. Every fill is released with Stack.done.
+	op *operation
 	// coordinate is how concurrent loads of layer are shared.
 	coordinate FillCoordination
 	// generation marks a generation's layer key: any copy a layer still keeps
@@ -668,8 +824,20 @@ type fill struct {
 	load func(ctx context.Context, ifNot string) (Entry, error)
 }
 
+// newFill registers a fill of layer, in flight from now until Stack.done.
 func (s *Stack) newFill(layer string, since uint64, coordinate FillCoordination) fill {
-	return fill{layer: layer, since: since, epoch: s.epochOf(layer), coordinate: coordinate}
+	return fill{layer: layer, since: since, op: s.inflight.begin(keyOf(layer)), coordinate: coordinate}
+}
+
+// done releases f's registration. Every newFill is paired with one, so the
+// in-flight set holds only the work actually running.
+func (s *Stack) done(f fill) { s.inflight.end(f.op) }
+
+// voided reports whether a write, or a notice a tier with a notifier below it
+// must respect, landed while f was reading: what it found may be older than
+// that change, so a store must be undone.
+func (s *Stack) voided(f fill, t *tier) bool {
+	return f.op.writes.Load() || (t.notifier >= 0 && f.op.notices.Load())
 }
 
 // verdict is what a read may do with a copy it found.
@@ -778,6 +946,13 @@ func (s *Stack) read(ctx context.Context, m Mode, f fill) (Entry, error) {
 func (s *Stack) refresh(m Mode, f fill, e Entry) {
 	s.run(func() {
 		_, _, _ = s.flight.Do("refresh\x00"+f.layer, func() (any, error) {
+			// The refresh loads the origin now, not when the read that
+			// scheduled it began, so it is its own operation: a write that
+			// landed in between is already in what it loads, and voiding the
+			// refresh for it would drop a current value.
+			f := f
+			f.op = s.inflight.begin(keyOf(f.layer))
+			defer s.done(f)
 			ctx, cancel := context.WithTimeout(context.Background(), s.loadTimeout)
 			defer cancel()
 			now := s.clock.Now()
@@ -844,6 +1019,7 @@ func (s *Stack) generation(ctx context.Context, m Mode, since uint64, key string
 		return "", nil // nothing is stored, so nothing needs invalidating
 	}
 	f := s.newFill(generationKey(key), since, s.mint)
+	defer s.done(f)
 	f.generation, f.load = true, mintGeneration
 	gm := m
 	gm.Fill = s.mint
@@ -1101,9 +1277,15 @@ func (s *Stack) store(ctx context.Context, m Mode, f fill, t *tier, e Entry) {
 	}
 	switch {
 	case err == nil:
-		now := s.epochOf(f.layer)
-		if now.writes != f.epoch.writes || (t.notifier >= 0 && now.notices != f.epoch.notices) {
-			_ = t.layer.Delete(ctx, f.layer)
+		if s.voided(f, t) {
+			// The copy may be older than the change that voided it, and this
+			// delete is the only thing keeping the tier off it: a failure here
+			// leaves a stale copy readable for the tier's whole TTL, so it
+			// quarantines the tier exactly as a missed invalidation does.
+			if err := t.layer.Delete(ctx, f.layer); err != nil {
+				t.breaker.failure()
+				t.quarantine.add(f.layer, s.clock.Now())
+			}
 		}
 	case errors.Is(err, ErrTooLarge), errors.Is(err, ErrFenced):
 	default:
@@ -1182,11 +1364,10 @@ func (s *Stack) write(ctx context.Context, p Partition, key string, value []byte
 		return ErrReadOnlyOrigin
 	}
 	if m.Write == PropagateBehind && !p.writeAround {
-		s.behind.enqueue(s, p, key, value, del)
-		return nil
+		return s.behind.enqueue(s, p, key, value, del)
 	}
 	if m.Failure == FailClosedPolicy && m.Write != PropagateOriginOnly {
-		if _, err := s.bump(ctx, key, FailClosedPolicy); err != nil {
+		if _, err := s.bump(ctx, key); err != nil {
 			return fmt.Errorf("%w: the origin was not written: %w", ErrUnavailable, err)
 		}
 	}
@@ -1204,7 +1385,7 @@ func (s *Stack) write(ctx context.Context, p Partition, key string, value []byte
 	if m.Write == PropagateOriginOnly {
 		return nil
 	}
-	generation, err := s.bump(ctx, key, FailDegrade)
+	generation, err := s.bump(ctx, key)
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrPartialWrite, err)
 	}
@@ -1216,6 +1397,7 @@ func (s *Stack) write(ctx context.Context, p Partition, key string, value []byte
 	// the generation is out, with a conditional load of the version it got.
 	// Unchanged, that transfers nothing; changed, the copy is the newer value.
 	f := s.newFill(p.entryKey(s.schema, generation, key), s.since(), m.Fill)
+	defer s.done(f)
 	f.load = func(ctx context.Context, ifNot string) (Entry, error) { return store.Load(ctx, key, ifNot) }
 	written := Entry{Value: value, Version: version}
 	if _, err := s.revalidate(ctx, m, f, &written); err != nil {
@@ -1235,7 +1417,12 @@ func (s *Stack) ownWindow() time.Duration {
 // skipping for reads, and failures are returned: a layer left on the old
 // generation would keep serving the old copies, so it is quarantined until the
 // new generation reaches it.
-func (s *Stack) bump(ctx context.Context, key string, _ FailurePolicy) (string, error) {
+//
+// It does not vary by failure policy — every layer is always attempted and
+// every failure always returned. What differs is what the caller does with
+// that: Stack.write bumps before the origin under FailClosed and gives up with
+// the origin untouched, and reports ErrPartialWrite under Degrade.
+func (s *Stack) bump(ctx context.Context, key string) (string, error) {
 	if len(s.tiers) == 0 {
 		return "", nil
 	}
@@ -1249,8 +1436,12 @@ func (s *Stack) bump(ctx context.Context, key string, _ FailurePolicy) (string, 
 // notice, touched while this one was under way is emptied of layerKey rather
 // than left holding this write's version over that one's.
 func (s *Stack) setAll(ctx context.Context, layerKey string, e Entry) error {
-	s.touch(layerKey)
-	start := s.epochOf(layerKey)
+	// This write is an operation of its own, so the touches below void the
+	// fills racing it without voiding it. The second touch, after the loop,
+	// catches a fill that registered while this write was under way.
+	op := s.inflight.begin(keyOf(layerKey))
+	defer s.inflight.end(op)
+	s.touch(layerKey, op)
 	var errs []error
 	for i := len(s.tiers) - 1; i >= 0; i-- {
 		t := s.tiers[i]
@@ -1258,8 +1449,7 @@ func (s *Stack) setAll(ctx context.Context, layerKey string, e Entry) error {
 		switch {
 		case err == nil:
 			t.quarantine.clear(layerKey)
-			now := s.epochOf(layerKey)
-			if i < len(s.tiers)-1 && (now.writes != start.writes || (t.notifier >= 0 && now.notices != start.notices)) {
+			if i < len(s.tiers)-1 && (op.writes.Load() || (t.notifier >= 0 && op.notices.Load())) {
 				if err := t.layer.Delete(ctx, layerKey); err != nil {
 					t.quarantine.add(layerKey, s.clock.Now())
 				}
@@ -1276,7 +1466,7 @@ func (s *Stack) setAll(ctx context.Context, layerKey string, e Entry) error {
 			errs = append(errs, fmt.Errorf("tier %d: %w", i, err))
 		}
 	}
-	s.touch(layerKey)
+	s.touch(layerKey, op)
 	return errors.Join(errs...)
 }
 
@@ -1292,12 +1482,14 @@ func (s *Stack) Invalidate(ctx context.Context, p Partition, key string) error {
 	if s.origin == nil {
 		return s.invalidate(ctx, p.layerKey(s.schema, key))
 	}
-	_, err := s.bump(ctx, key, FailDegrade)
+	_, err := s.bump(ctx, key)
 	return err
 }
 
 func (s *Stack) invalidate(ctx context.Context, layerKey string) error {
-	s.touch(layerKey)
+	op := s.inflight.begin(keyOf(layerKey))
+	defer s.inflight.end(op)
+	s.touch(layerKey, op)
 	var errs []error
 	for i := len(s.tiers) - 1; i >= 0; i-- {
 		t := s.tiers[i]
@@ -1309,7 +1501,7 @@ func (s *Stack) invalidate(ctx context.Context, layerKey string) error {
 		}
 		t.quarantine.clear(layerKey)
 	}
-	s.touch(layerKey)
+	s.touch(layerKey, op)
 	return errors.Join(errs...)
 }
 
@@ -1418,15 +1610,36 @@ func (q *quarantine) reset() {
 // ownWrites remembers the version each key's last write through this stack
 // produced, for ReadYourWrites, for as long as a copy older than it can
 // outlive it in a layer.
+//
+// Every write through the stack records one, whatever its mode, because a
+// later read may ask for ReadYourWrites per call on a stack that does not
+// configure it — so a write cannot know whether its record will be needed.
+// Expiry therefore has to cost nothing per write: keys are also held in a ring
+// of time buckets, and a bucket is dropped wholesale the first time it comes
+// round again, one window later. Scanning every live entry on each write
+// instead made one write cost O(keys written in the window), serialized on this
+// mutex.
 type ownWrites struct {
 	mu     sync.Mutex
-	writes map[string]ownWrite
+	writes map[string]ownWrite // key -> its newest write, looked up in O(1)
+	ring   [ownWriteBuckets]ownBucket
+}
+
+// ownWriteBuckets is the ring's length. Each bucket spans window/(n-1), so a
+// bucket comes round again a little more than one window after it was filled:
+// every entry lives at least its whole window.
+const ownWriteBuckets = 16
+
+type ownBucket struct {
+	cycle int64
+	keys  []string
 }
 
 type ownWrite struct {
 	version string
 	deleted bool
 	until   time.Time
+	cycle   int64 // the ring cycle this write was recorded in
 }
 
 func (o *ownWrites) record(key, version string, deleted bool, at time.Time, window time.Duration) {
@@ -1435,14 +1648,31 @@ func (o *ownWrites) record(key, version string, deleted bool, at time.Time, wind
 	if o.writes == nil {
 		o.writes = map[string]ownWrite{}
 	}
-	if len(o.writes) >= 1024 {
-		for k, w := range o.writes {
-			if at.After(w.until) {
+	step := window / (ownWriteBuckets - 1)
+	if step <= 0 {
+		step = time.Nanosecond
+	}
+	cycle := at.UnixNano() / int64(step)
+	b := &o.ring[((cycle%ownWriteBuckets)+ownWriteBuckets)%ownWriteBuckets]
+	if b.cycle != cycle {
+		// The bucket has come round again, so everything it holds is past its
+		// window: drop it wholesale rather than scan every live key. A key
+		// rewritten since carries a later cycle and is left alone.
+		held := len(b.keys)
+		for _, k := range b.keys {
+			if w, ok := o.writes[k]; ok && w.cycle == b.cycle {
 				delete(o.writes, k)
 			}
 		}
+		if cap(b.keys) > 1024 && cap(b.keys) > 4*held {
+			b.keys = nil // a past burst does not pin its capacity for good
+		} else {
+			b.keys = b.keys[:0]
+		}
+		b.cycle = cycle
 	}
-	o.writes[key] = ownWrite{version: version, deleted: deleted, until: at.Add(window)}
+	b.keys = append(b.keys, key)
+	o.writes[key] = ownWrite{version: version, deleted: deleted, until: at.Add(window), cycle: cycle}
 }
 
 func (o *ownWrites) lookup(key string, now time.Time) (ownWrite, bool) {
@@ -1475,6 +1705,7 @@ type writeBehind struct {
 	closed   bool
 	next     uint64
 	errs     []error
+	bound    int           // the most writes the queue may hold
 	idle     chan struct{} // closed when the queue empties
 }
 
@@ -1492,14 +1723,22 @@ type behindWrite struct {
 	at    time.Time
 }
 
-func (w *writeBehind) init() {
+func (w *writeBehind) init(bound int) {
 	w.pendings = map[pendingKey]behindWrite{}
+	w.bound = bound
 	w.idle = make(chan struct{})
 	close(w.idle)
 }
 
-func (w *writeBehind) enqueue(s *Stack, p Partition, key string, value []byte, del bool) {
+// enqueue takes a write for the origin, or refuses it when the queue is at its
+// bound: acknowledging past that point would trade an error the caller can see
+// for a queue that grows until the process dies and loses every write in it.
+func (w *writeBehind) enqueue(s *Stack, p Partition, key string, value []byte, del bool) error {
 	w.mu.Lock()
+	if w.bound > 0 && len(w.queue) >= w.bound {
+		w.mu.Unlock()
+		return fmt.Errorf("%w: %d writes are waiting for the origin", ErrWriteBehindFull, w.bound)
+	}
 	w.next++
 	bw := behindWrite{id: w.next, p: p, key: key, value: append([]byte(nil), value...), del: del, at: s.clock.Now()}
 	w.queue = append(w.queue, bw)
@@ -1513,6 +1752,7 @@ func (w *writeBehind) enqueue(s *Stack, p Partition, key string, value []byte, d
 	if start {
 		s.run(func() { w.drain(s) })
 	}
+	return nil
 }
 
 func (w *writeBehind) pending(p Partition, key string) (Entry, bool) {
@@ -1535,9 +1775,19 @@ func (w *writeBehind) drain(s *Stack) {
 	for {
 		w.mu.Lock()
 		if len(w.queue) == 0 || w.closed {
+			// A close with writes still queued loses them, which is what
+			// AcceptWriteLoss acknowledges — but silently losing them would
+			// leave the caller no way to know which. Record and report each,
+			// so Drain returns them and WithWriteBehindErrors fires.
+			dropped := w.abandonLocked()
 			w.running = false
 			close(w.idle)
 			w.mu.Unlock()
+			for _, d := range dropped {
+				if s.behindErrors != nil {
+					s.behindErrors(d.key, d.err)
+				}
+			}
 			return
 		}
 		bw := w.queue[0]
@@ -1561,12 +1811,18 @@ func (w *writeBehind) drain(s *Stack) {
 		}
 		if err == nil {
 			s.own.record(bw.key, version, bw.del, bw.at, s.ownWindow())
-			_, _ = s.bump(ctx, bw.key, FailDegrade)
+			_, _ = s.bump(ctx, bw.key)
 		}
 		cancel()
 
 		w.mu.Lock()
+		// Clear the slot before advancing: the array is reused up to the
+		// queue's bound, and a written value must not be held in it.
+		w.queue[0] = behindWrite{}
 		w.queue = w.queue[1:]
+		if len(w.queue) == 0 {
+			w.queue = nil // release the array once nothing is waiting
+		}
 		if cur, ok := w.pendings[pendingKey{bw.p, bw.key}]; ok && cur.id == bw.id {
 			delete(w.pendings, pendingKey{bw.p, bw.key})
 		}
@@ -1579,6 +1835,31 @@ func (w *writeBehind) drain(s *Stack) {
 			s.behindErrors(bw.key, err)
 		}
 	}
+}
+
+// abandonLocked gives up every write still queued, recording one error each so
+// Drain reports them, and stops serving them as pending: they will never reach
+// the origin, so a read must see what the origin actually holds.
+func (w *writeBehind) abandonLocked() []droppedWrite {
+	if len(w.queue) == 0 {
+		return nil
+	}
+	dropped := make([]droppedWrite, 0, len(w.queue))
+	for _, bw := range w.queue {
+		err := fmt.Errorf("cache: write-behind of %q dropped: the stack was closed before the origin took it (call Stack.Drain first)", bw.key)
+		w.errs = append(w.errs, err)
+		dropped = append(dropped, droppedWrite{key: bw.key, err: err})
+		if cur, ok := w.pendings[pendingKey{bw.p, bw.key}]; ok && cur.id == bw.id {
+			delete(w.pendings, pendingKey{bw.p, bw.key})
+		}
+	}
+	w.queue = nil
+	return dropped
+}
+
+type droppedWrite struct {
+	key string
+	err error
 }
 
 func (w *writeBehind) close() {

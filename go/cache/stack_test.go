@@ -224,6 +224,204 @@ func TestWriteDuringLoadIsNotOverwritten(t *testing.T) {
 	assertGet(t, other, "k", "after")
 }
 
+// A fill is voided by a write to its own key, never by a write to a different
+// one. The stack once tracked this with 4096 hashed counters shared by every
+// key, so a write to any key that hashed into the same slot deleted the copy a
+// fill had just stored — an invisible hit-rate collapse that grew with the
+// write rate. "k1" and "user:7510" are a pair that collided in that scheme
+// (both fnv64a % 4096 == 1217); "user:1" did not, and is the control.
+func TestWriteToAnotherKeyKeepsFill(t *testing.T) {
+	for _, other := range []string{"user:7510", "user:1"} {
+		t.Run(other, func(t *testing.T) {
+			ctx := context.Background()
+			o := newOrigin()
+			o.put("k1", "v1")
+			o.put(other, "o1")
+			top := cache.NewMemory()
+			s := newStack(t, cache.WithTier(top, time.Hour), cache.WithOrigin(o))
+
+			// Warm both keys, so the write below only replaces a generation
+			// the reader has already read, and drop k1's copy alone: the read
+			// under test is a fill of k1's entry key and nothing else.
+			assertGet(t, s, "k1", "v1")
+			assertGet(t, s, other, "o1")
+			if err := top.Delete(ctx, cache.EntryKey(s, tenant, "k1")); err != nil {
+				t.Fatal(err)
+			}
+
+			held, release := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			o.onLoad = func(key string) {
+				if key == "k1" {
+					once.Do(func() { close(held); <-release })
+				}
+			}
+			done := make(chan struct{})
+			go func() { defer close(done); assertGet(t, s, "k1", "v1") }()
+			<-held
+			if err := s.Set(ctx, tenant, other, []byte("o2")); err != nil {
+				t.Fatal(err)
+			}
+			close(release)
+			<-done
+			o.onLoad = nil
+
+			// k1 was not written, so the fill it just made must still be there.
+			if _, err := top.Get(ctx, cache.EntryKey(s, tenant, "k1")); err != nil {
+				t.Fatalf("a write to %q discarded k1's fill: %v", other, err)
+			}
+			loads := o.loads.Load()
+			assertGet(t, s, "k1", "v1")
+			if n := o.loads.Load() - loads; n != 0 {
+				t.Errorf("reading k1 after a write to %q reached the origin %d times, want 0", other, n)
+			}
+		})
+	}
+}
+
+// hookedLayer runs afterGet once a Get has its answer, to interpose a write
+// between a fill's read of a lower tier and its store into an upper one.
+type hookedLayer struct {
+	cache.Layer
+	afterGet func(key string)
+}
+
+func (h *hookedLayer) Get(ctx context.Context, key string) (cache.Entry, error) {
+	e, err := h.Layer.Get(ctx, key)
+	if h.afterGet != nil {
+		h.afterGet(key)
+	}
+	return e, err
+}
+
+// refusesDelete answers reads and takes writes but refuses every Delete, as a
+// layer with a transient fault would.
+type refusesDelete struct{ cache.Layer }
+
+func (refusesDelete) Delete(context.Context, string) error { return errors.New("delete refused") }
+
+// A fill that raced a write of its own key stores a copy it must then undo.
+// When that undo fails, the tier is left holding the value the write replaced,
+// so it must be quarantined — the stack must not read it again until the delete
+// lands. It used to be discarded with `_ = t.layer.Delete(...)`, which left the
+// tier serving the pre-write value for its whole TTL after Set had already
+// returned success.
+func TestFailedUndoQuarantinesTier(t *testing.T) {
+	ctx := context.Background()
+	top := cache.NewMemory()
+	deep := cache.NewMemory()
+	// No origin: there is no generation to orphan the racing fill, so the undo
+	// is the only thing keeping the top tier off the stale copy.
+	topTier := &hookedLayer{Layer: refusesDelete{top}}
+	deepTier := &hookedLayer{Layer: deep}
+	s := newStack(t, cache.WithTier(topTier, time.Hour), cache.WithTier(deepTier, time.Hour))
+
+	if err := s.Set(ctx, tenant, "k", []byte("v1")); err != nil {
+		t.Fatal(err)
+	}
+	layerKey := cache.EntryKey(s, tenant, "k")
+	if err := top.Delete(ctx, layerKey); err != nil { // top tier empty: the read refills it
+		t.Fatal(err)
+	}
+
+	var once sync.Once
+	deepTier.afterGet = func(key string) {
+		if key != layerKey {
+			return
+		}
+		once.Do(func() {
+			// The reader holds v1 from the deep tier. Write v2 through the same
+			// stack before it stores what it read.
+			if err := s.Set(ctx, tenant, "k", []byte("v2")); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	if _, err := s.Get(ctx, tenant, "k"); err != nil {
+		t.Fatal(err)
+	}
+	// The undo was refused, so the top tier really does hold the old value.
+	if e, err := top.Get(ctx, layerKey); err != nil || string(e.Value) != "v1" {
+		t.Fatalf("top tier holds %q (%v); the test needs it holding the pre-write value", e.Value, err)
+	}
+	// The stack must not serve it: the tier is quarantined, so the read falls
+	// through to the tier that took the write.
+	assertGet(t, s, "k", "v2")
+	assertGet(t, s, "k", "v2")
+}
+
+// The write-behind queue must not grow without limit. An origin that stops
+// taking writes used to leave Set acknowledging for ever while the queue grew
+// until the process died — losing every write in it, which is a far bigger loss
+// than the crash AcceptWriteLoss asks the caller to accept. Past the bound the
+// caller is told instead.
+func TestWriteBehindQueueIsBounded(t *testing.T) {
+	ctx := context.Background()
+	o := newOrigin()
+	// An executor that never runs the drain: the queue only fills.
+	s := newStack(t,
+		cache.WithTier(cache.NewMemory(), time.Hour),
+		cache.WithOrigin(o),
+		cache.WithExecutor(func(func()) {}),
+		cache.WithWriteBehindQueue(4),
+		cache.WithMode(cache.WriteBehind(cache.AcceptWriteLoss)))
+	for i := range 4 {
+		if err := s.Set(ctx, tenant, fmt.Sprintf("k%d", i), []byte("v")); err != nil {
+			t.Fatalf("write %d within the bound: %v", i, err)
+		}
+	}
+	err := s.Set(ctx, tenant, "one-too-many", []byte("v"))
+	if !errors.Is(err, cache.ErrWriteBehindFull) {
+		t.Fatalf("a write past the queue bound = %v, want ErrWriteBehindFull", err)
+	}
+	// It was refused, not queued: the caller owns it, so nothing pretends to.
+	if v, err := s.Get(ctx, tenant, "one-too-many"); !errors.Is(err, cache.ErrNotFound) {
+		t.Fatalf("reading the refused write = %q, %v; want ErrNotFound", v, err)
+	}
+	if err := cache.WithWriteBehindQueue(0)(&cache.Stack{}); err == nil {
+		t.Fatal("WithWriteBehindQueue(0) was accepted")
+	}
+}
+
+// An exact key space must win over a prefix of the same length, whichever was
+// registered first: the patterns tied on length alone, so option order decided
+// which consistency mode a key ran in.
+func TestExactKeySpaceBeatsPrefixOfEqualLength(t *testing.T) {
+	ctx := context.Background()
+	exact := cache.WithKeySpace("user:1234", cache.TTLBounded(11*time.Second))
+	prefix := cache.WithKeySpace("user:1234*", cache.TTLBounded(22*time.Second))
+	for _, c := range []struct {
+		name  string
+		order []cache.Option
+	}{
+		{"exact first", []cache.Option{exact, prefix}},
+		{"prefix first", []cache.Option{prefix, exact}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s, err := cache.New(ctx, append([]cache.Option{cache.WithTier(cache.NewMemory(), time.Hour)}, c.order...)...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+			m, err := s.Mode("user:1234")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := m.Freshness.String(); got != "TTLBounded(11s)" {
+				t.Errorf("the exact key's mode = %s, want the exact key space's TTLBounded(11s)", got)
+			}
+			// A key only the prefix matches still gets the prefix's mode.
+			m, err = s.Mode("user:12345")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := m.Freshness.String(); got != "TTLBounded(22s)" {
+				t.Errorf("a key under the prefix = %s, want TTLBounded(22s)", got)
+			}
+		})
+	}
+}
+
 func TestMemoryLimits(t *testing.T) {
 	ctx := context.Background()
 	m := cache.NewMemory(cache.MaxEntries(2), cache.MaxValueBytes(4))
@@ -253,6 +451,7 @@ type origin struct {
 	loads    atomic.Int32
 	notMod   atomic.Int32
 	delay    time.Duration
+	onLoad   func(key string) // runs before the value is read, to interpose
 }
 
 func newOrigin() *origin {
@@ -262,6 +461,9 @@ func newOrigin() *origin {
 func (o *origin) Load(_ context.Context, key, ifNot string) (cache.Entry, error) {
 	o.loads.Add(1)
 	time.Sleep(o.delay)
+	if o.onLoad != nil {
+		o.onLoad(key)
+	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	v, ok := o.values[key]

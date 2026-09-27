@@ -11,6 +11,7 @@ func EntryKey(s *Stack, p Partition, key string) string {
 	generation := ""
 	if len(s.tiers) > 0 {
 		f := s.newFill(generationKey(key), s.since(), s.mint)
+		defer s.done(f)
 		f.generation = true
 		e, err := s.read(context.Background(), s.mode, f)
 		if err != nil {

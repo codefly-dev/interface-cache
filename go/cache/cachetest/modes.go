@@ -3,6 +3,7 @@ package cachetest
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -285,8 +286,16 @@ func runWrites(t *testing.T, h Harness) {
 		eventually(t, 5*time.Second, func() bool { return getString(t, b, tenantU, "k") == "two" },
 			"another process never read the landed write")
 
-		// A process that dies — closes without draining — loses its queue.
-		c, _, _ := w.process(t, behind)
+		// A process that dies — closes without draining — loses its queue, and
+		// says which writes it lost: the loss AcceptWriteLoss acknowledges is
+		// reported, never silent.
+		var reported []string
+		var reportedMu sync.Mutex
+		c, _, _ := w.process(t, behind, cache.WithWriteBehindErrors(func(key string, _ error) {
+			reportedMu.Lock()
+			defer reportedMu.Unlock()
+			reported = append(reported, key)
+		}))
 		if err := c.Set(ctx, tenantU, "k", []byte("lost")); err != nil {
 			t.Fatal(err)
 		}
@@ -294,6 +303,15 @@ func runWrites(t *testing.T, h Harness) {
 		w.tasks.runAll()
 		if got := w.origin.current("k").value; got != "two" {
 			t.Fatalf("the origin holds %q after the writer closed without draining, want the write lost", got)
+		}
+		reportedMu.Lock()
+		got := append([]string(nil), reported...)
+		reportedMu.Unlock()
+		if len(got) != 1 || got[0] != "k" {
+			t.Fatalf("closing without draining reported %v as lost, want [k]", got)
+		}
+		if err := c.Drain(ctx); err == nil || !strings.Contains(err.Error(), "k") {
+			t.Fatalf("Drain after the queue was abandoned = %v, want it to name the lost write", err)
 		}
 	})
 }
