@@ -58,6 +58,15 @@ func New(client storagev0.ObjectStorageClient, opts ...Option) *Source {
 	return s
 }
 
+// Capabilities implements cache.Declarer: loads are conditional on the ETag,
+// answered by the gateway, so the source keeps Validated. ETags are not
+// ordered, so it is not Sequenced, and the gateway reports no changes, so it is
+// no ChangeFeed: a write that bypasses the stack reaches a copy only through
+// its freshness mode, or Stack.Invalidate.
+func (s *Source) Capabilities() cache.Capabilities {
+	return cache.Capabilities{ConditionalLoads: true}
+}
+
 // Load implements cache.Source. The object's ETag is the entry's version.
 func (s *Source) Load(ctx context.Context, key string, ifNotVersion string) (cache.Entry, error) {
 	ctx, cancel := context.WithCancel(ctx)

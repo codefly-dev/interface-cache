@@ -235,3 +235,42 @@ func TestStackOverObjectStorage(t *testing.T) {
 		t.Fatalf("expired entry was reloaded unconditionally (%d conditional loads)", n)
 	}
 }
+
+// Validated checks the gateway on every read: a write that bypassed the stack
+// is served at once, and an unchanged object costs a conditional load, not a
+// transfer. FillVersionFenced is refused: ETags do not order versions.
+func TestValidatedOverObjectStorage(t *testing.T) {
+	ctx := context.Background()
+	src := &countingSource{Source: objectstorage.New(gateway)}
+	s, err := cache.New(ctx, cache.WithTier(cache.NewMemory(), time.Hour), cache.WithOrigin(src), cache.WithTTLJitter(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	p := cache.NewPartition("tenant")
+	if err := s.Set(ctx, p, key(t), []byte("doc v1")); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := s.Get(ctx, p, key(t)); err != nil || string(v) != "doc v1" {
+		t.Fatalf("Get = %q, %v", v, err)
+	}
+	// Around the stack: straight to the gateway.
+	if _, err := objectstorage.New(gateway).Put(ctx, key(t), []byte("doc v2")); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := s.Get(ctx, p, key(t)); string(v) != "doc v1" {
+		t.Fatalf("the default mode read %q; its copy is within its TTL", v)
+	}
+	before := src.conditional.Load()
+	for range 2 {
+		if v, err := s.Get(ctx, p, key(t), cache.Validated()); err != nil || string(v) != "doc v2" {
+			t.Fatalf("a validated read = %q, %v; want the gateway's current object", v, err)
+		}
+	}
+	if n := src.conditional.Load() - before; n != 2 {
+		t.Fatalf("two validated reads made %d conditional loads, want 2", n)
+	}
+	if _, err := cache.New(ctx, cache.WithTier(cache.NewMemory(), time.Hour), cache.WithOrigin(src), cache.WithMode(cache.FillVersionFenced())); !errors.Is(err, cache.ErrUnsupportedMode) {
+		t.Fatalf("FillVersionFenced over object storage = %v, want a refusal", err)
+	}
+}

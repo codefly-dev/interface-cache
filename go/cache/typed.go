@@ -6,7 +6,9 @@ import (
 )
 
 // Codec converts a value to and from the bytes a stack stores. A stack holds
-// one kind of value, so it takes one codec.
+// one kind of value, so it takes one codec. When the codec changes the shape
+// of the bytes, give the stack a new WithSchema, so the new code never decodes
+// bytes the old one cached.
 type Codec[T any] interface {
 	Marshal(v T) ([]byte, error)
 	Unmarshal(data []byte) (T, error)
@@ -37,9 +39,9 @@ func NewTyped[T any](stack *Stack, codec Codec[T]) *Typed[T] {
 }
 
 // Get returns the decoded value for key in partition p, with Stack.Get's
-// errors.
-func (t *Typed[T]) Get(ctx context.Context, p Partition, key string) (T, error) {
-	data, err := t.stack.Get(ctx, p, key)
+// errors; opts override the mode for this read.
+func (t *Typed[T]) Get(ctx context.Context, p Partition, key string, opts ...ModeOption) (T, error) {
+	data, err := t.stack.Get(ctx, p, key, opts...)
 	if err != nil {
 		var zero T
 		return zero, err
@@ -48,17 +50,17 @@ func (t *Typed[T]) Get(ctx context.Context, p Partition, key string) (T, error) 
 }
 
 // Set encodes v and writes it as Stack.Set does.
-func (t *Typed[T]) Set(ctx context.Context, p Partition, key string, v T) error {
+func (t *Typed[T]) Set(ctx context.Context, p Partition, key string, v T, opts ...ModeOption) error {
 	data, err := t.codec.Marshal(v)
 	if err != nil {
 		return err
 	}
-	return t.stack.Set(ctx, p, key, data)
+	return t.stack.Set(ctx, p, key, data, opts...)
 }
 
 // Delete removes key as Stack.Delete does.
-func (t *Typed[T]) Delete(ctx context.Context, p Partition, key string) error {
-	return t.stack.Delete(ctx, p, key)
+func (t *Typed[T]) Delete(ctx context.Context, p Partition, key string, opts ...ModeOption) error {
+	return t.stack.Delete(ctx, p, key, opts...)
 }
 
 // Stack returns the underlying stack.

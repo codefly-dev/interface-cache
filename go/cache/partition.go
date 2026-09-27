@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"strconv"
+	"strings"
 )
 
 var (
@@ -71,38 +72,91 @@ func NewPartition(key string, opts ...PartitionOption) Partition {
 // vary by viewer. It is refused by every other stack.
 func Global() Partition { return Partition{global: true} }
 
-// The keys a stack uses in its layers. The leading byte names the family, and
-// every variable part before the caller's key is length-prefixed, so no
-// partition, generation and key can spell another's layer key.
+// The keys a stack uses in its layers. Every key starts with the interface's
+// key format, "3" since 0.3.0, so a stack never reads what a stack of another
+// interface version stored. The next byte names the family, and every variable
+// part before the caller's key is length-prefixed, so no schema, partition,
+// generation and key can spell another's layer key.
 //
-//	value, no origin      "p" len ":" partition ":" key    |  "g:" key
-//	copy of an origin key "P" len ":" partition ":" len ":" generation ":" key
-//	                      "G" len ":" generation ":" key
-//	generation            "i:" key
+//	value, no origin      "3p" len ":" schema ":" len ":" partition ":" key
+//	                      "3g" len ":" schema ":" key
+//	copy of an origin key "3P" len ":" schema ":" len ":" partition ":" len ":" generation ":" key
+//	                      "3G" len ":" schema ":" len ":" generation ":" key
+//	generation            "3i:" key
 //
-// Write-around does not change the key.
+// The schema (WithSchema) names the shape of the values, so a deploy that
+// changes it never decodes the bytes its predecessor cached. Generations carry
+// no schema: a write by a process of either shape invalidates both shapes'
+// copies. Write-around does not change the key.
 
 // layerKey is where a stack without an origin stores key in p.
-func (p Partition) layerKey(key string) string {
+func (p Partition) layerKey(schema, key string) string {
 	if p.global {
-		return "g:" + key
+		return "3g" + lengthPrefixed(schema) + key
 	}
-	return "p" + strconv.Itoa(len(p.key)) + ":" + p.key + ":" + key
+	return "3p" + lengthPrefixed(schema) + lengthPrefixed(p.key) + key
 }
 
 // entryKey is where a stack with an origin stores its copy of key in p, under
 // the key's current generation.
-func (p Partition) entryKey(generation, key string) string {
-	g := strconv.Itoa(len(generation)) + ":" + generation + ":" + key
+func (p Partition) entryKey(schema, generation, key string) string {
+	g := lengthPrefixed(generation) + key
 	if p.global {
-		return "G" + g
+		return "3G" + lengthPrefixed(schema) + g
 	}
-	return "P" + strconv.Itoa(len(p.key)) + ":" + p.key + ":" + g
+	return "3P" + lengthPrefixed(schema) + lengthPrefixed(p.key) + g
+}
+
+func lengthPrefixed(s string) string { return strconv.Itoa(len(s)) + ":" + s + ":" }
+
+// keyOf returns the cache key a layer key of this format names, or the layer
+// key itself when it is not one: a notice may name a key some other program
+// wrote.
+func keyOf(layerKey string) string {
+	if len(layerKey) < 3 || layerKey[0] != '3' {
+		return layerKey
+	}
+	rest := layerKey[2:]
+	skip := func(n int) bool { // drops n length-prefixed parts
+		for range n {
+			colon := strings.IndexByte(rest, ':')
+			if colon < 0 {
+				return false
+			}
+			size, err := strconv.Atoi(rest[:colon])
+			if err != nil || size < 0 || colon+1+size+1 > len(rest) || rest[colon+1+size] != ':' {
+				return false
+			}
+			rest = rest[colon+1+size+1:]
+		}
+		return true
+	}
+	var ok bool
+	switch layerKey[1] {
+	case 'i':
+		ok = rest != "" && rest[0] == ':'
+		rest = strings.TrimPrefix(rest, ":")
+	case 'g':
+		ok = skip(1)
+	case 'p', 'G':
+		ok = skip(2)
+	case 'P':
+		ok = skip(3)
+	}
+	if !ok {
+		return layerKey
+	}
+	return rest
 }
 
 // generationKey is where the layers hold key's generation. It is shared by
-// every partition: a write replaces it, which orphans every partition's copy.
-func generationKey(key string) string { return "i:" + key }
+// every partition and schema: a write replaces it, which orphans every copy.
+func generationKey(key string) string { return "3i:" + key }
+
+// GenerationKey is the layer key under which a stack over an origin keeps
+// key's generation, the token a write replaces. It is exported for
+// conformance tooling, which watches for its notices; nothing else needs it.
+func GenerationKey(key string) string { return generationKey(key) }
 
 // newGeneration returns a token no earlier generation of any key used, so an
 // expired or evicted generation is replaced by one no stored copy is under.

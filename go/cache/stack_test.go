@@ -71,11 +71,11 @@ type lossyMemory struct {
 	*cache.Memory
 	mu      *sync.Mutex
 	dropped *bool
-	resyncs *[]func()
+	gaps    *[][2]func()
 }
 
 func newLossyMemory(m *cache.Memory) lossyMemory {
-	return lossyMemory{Memory: m, mu: &sync.Mutex{}, dropped: new(bool), resyncs: new([]func())}
+	return lossyMemory{Memory: m, mu: &sync.Mutex{}, dropped: new(bool), gaps: new([][2]func())}
 }
 
 func (l lossyMemory) Subscribe(ctx context.Context, fn func(string)) (func(), error) {
@@ -89,25 +89,41 @@ func (l lossyMemory) Subscribe(ctx context.Context, fn func(string)) (func(), er
 	})
 }
 
-func (l lossyMemory) SubscribeResync(_ context.Context, fn func()) (func(), error) {
+func (l lossyMemory) Capabilities() cache.Capabilities {
+	c := l.Memory.Capabilities()
+	c.Resyncs = true
+	return c
+}
+
+func (l lossyMemory) SubscribeGaps(_ context.Context, lost, resynced func()) (func(), error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	*l.resyncs = append(*l.resyncs, fn)
+	*l.gaps = append(*l.gaps, [2]func(){lost, resynced})
 	return func() {}, nil
 }
 
-// interrupt opens a gap, runs lose inside it, then closes it and signals.
-func (l lossyMemory) interrupt(lose func()) {
+// interrupt opens a gap, runs lose inside it, then closes it. It reports the
+// gap only once it is over when late is set, the way a driver that notices
+// the loss only on reconnecting would.
+func (l lossyMemory) interrupt(lose func(), late ...bool) {
 	l.mu.Lock()
 	*l.dropped = true
+	gaps := append([][2]func(){}, *l.gaps...)
 	l.mu.Unlock()
+	if len(late) == 0 {
+		for _, g := range gaps {
+			g[0]()
+		}
+	}
 	lose()
 	l.mu.Lock()
 	*l.dropped = false
-	fns := append([]func(){}, *l.resyncs...)
 	l.mu.Unlock()
-	for _, fn := range fns {
-		fn()
+	for _, g := range gaps {
+		if len(late) > 0 {
+			g[0]()
+		}
+		g[1]()
 	}
 }
 
@@ -208,6 +224,204 @@ func TestWriteDuringLoadIsNotOverwritten(t *testing.T) {
 	assertGet(t, other, "k", "after")
 }
 
+// A fill is voided by a write to its own key, never by a write to a different
+// one. The stack once tracked this with 4096 hashed counters shared by every
+// key, so a write to any key that hashed into the same slot deleted the copy a
+// fill had just stored — an invisible hit-rate collapse that grew with the
+// write rate. "k1" and "user:7510" are a pair that collided in that scheme
+// (both fnv64a % 4096 == 1217); "user:1" did not, and is the control.
+func TestWriteToAnotherKeyKeepsFill(t *testing.T) {
+	for _, other := range []string{"user:7510", "user:1"} {
+		t.Run(other, func(t *testing.T) {
+			ctx := context.Background()
+			o := newOrigin()
+			o.put("k1", "v1")
+			o.put(other, "o1")
+			top := cache.NewMemory()
+			s := newStack(t, cache.WithTier(top, time.Hour), cache.WithOrigin(o))
+
+			// Warm both keys, so the write below only replaces a generation
+			// the reader has already read, and drop k1's copy alone: the read
+			// under test is a fill of k1's entry key and nothing else.
+			assertGet(t, s, "k1", "v1")
+			assertGet(t, s, other, "o1")
+			if err := top.Delete(ctx, cache.EntryKey(s, tenant, "k1")); err != nil {
+				t.Fatal(err)
+			}
+
+			held, release := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			o.onLoad = func(key string) {
+				if key == "k1" {
+					once.Do(func() { close(held); <-release })
+				}
+			}
+			done := make(chan struct{})
+			go func() { defer close(done); assertGet(t, s, "k1", "v1") }()
+			<-held
+			if err := s.Set(ctx, tenant, other, []byte("o2")); err != nil {
+				t.Fatal(err)
+			}
+			close(release)
+			<-done
+			o.onLoad = nil
+
+			// k1 was not written, so the fill it just made must still be there.
+			if _, err := top.Get(ctx, cache.EntryKey(s, tenant, "k1")); err != nil {
+				t.Fatalf("a write to %q discarded k1's fill: %v", other, err)
+			}
+			loads := o.loads.Load()
+			assertGet(t, s, "k1", "v1")
+			if n := o.loads.Load() - loads; n != 0 {
+				t.Errorf("reading k1 after a write to %q reached the origin %d times, want 0", other, n)
+			}
+		})
+	}
+}
+
+// hookedLayer runs afterGet once a Get has its answer, to interpose a write
+// between a fill's read of a lower tier and its store into an upper one.
+type hookedLayer struct {
+	cache.Layer
+	afterGet func(key string)
+}
+
+func (h *hookedLayer) Get(ctx context.Context, key string) (cache.Entry, error) {
+	e, err := h.Layer.Get(ctx, key)
+	if h.afterGet != nil {
+		h.afterGet(key)
+	}
+	return e, err
+}
+
+// refusesDelete answers reads and takes writes but refuses every Delete, as a
+// layer with a transient fault would.
+type refusesDelete struct{ cache.Layer }
+
+func (refusesDelete) Delete(context.Context, string) error { return errors.New("delete refused") }
+
+// A fill that raced a write of its own key stores a copy it must then undo.
+// When that undo fails, the tier is left holding the value the write replaced,
+// so it must be quarantined — the stack must not read it again until the delete
+// lands. It used to be discarded with `_ = t.layer.Delete(...)`, which left the
+// tier serving the pre-write value for its whole TTL after Set had already
+// returned success.
+func TestFailedUndoQuarantinesTier(t *testing.T) {
+	ctx := context.Background()
+	top := cache.NewMemory()
+	deep := cache.NewMemory()
+	// No origin: there is no generation to orphan the racing fill, so the undo
+	// is the only thing keeping the top tier off the stale copy.
+	topTier := &hookedLayer{Layer: refusesDelete{top}}
+	deepTier := &hookedLayer{Layer: deep}
+	s := newStack(t, cache.WithTier(topTier, time.Hour), cache.WithTier(deepTier, time.Hour))
+
+	if err := s.Set(ctx, tenant, "k", []byte("v1")); err != nil {
+		t.Fatal(err)
+	}
+	layerKey := cache.EntryKey(s, tenant, "k")
+	if err := top.Delete(ctx, layerKey); err != nil { // top tier empty: the read refills it
+		t.Fatal(err)
+	}
+
+	var once sync.Once
+	deepTier.afterGet = func(key string) {
+		if key != layerKey {
+			return
+		}
+		once.Do(func() {
+			// The reader holds v1 from the deep tier. Write v2 through the same
+			// stack before it stores what it read.
+			if err := s.Set(ctx, tenant, "k", []byte("v2")); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	if _, err := s.Get(ctx, tenant, "k"); err != nil {
+		t.Fatal(err)
+	}
+	// The undo was refused, so the top tier really does hold the old value.
+	if e, err := top.Get(ctx, layerKey); err != nil || string(e.Value) != "v1" {
+		t.Fatalf("top tier holds %q (%v); the test needs it holding the pre-write value", e.Value, err)
+	}
+	// The stack must not serve it: the tier is quarantined, so the read falls
+	// through to the tier that took the write.
+	assertGet(t, s, "k", "v2")
+	assertGet(t, s, "k", "v2")
+}
+
+// The write-behind queue must not grow without limit. An origin that stops
+// taking writes used to leave Set acknowledging for ever while the queue grew
+// until the process died — losing every write in it, which is a far bigger loss
+// than the crash AcceptWriteLoss asks the caller to accept. Past the bound the
+// caller is told instead.
+func TestWriteBehindQueueIsBounded(t *testing.T) {
+	ctx := context.Background()
+	o := newOrigin()
+	// An executor that never runs the drain: the queue only fills.
+	s := newStack(t,
+		cache.WithTier(cache.NewMemory(), time.Hour),
+		cache.WithOrigin(o),
+		cache.WithExecutor(func(func()) {}),
+		cache.WithWriteBehindQueue(4),
+		cache.WithMode(cache.WriteBehind(cache.AcceptWriteLoss)))
+	for i := range 4 {
+		if err := s.Set(ctx, tenant, fmt.Sprintf("k%d", i), []byte("v")); err != nil {
+			t.Fatalf("write %d within the bound: %v", i, err)
+		}
+	}
+	err := s.Set(ctx, tenant, "one-too-many", []byte("v"))
+	if !errors.Is(err, cache.ErrWriteBehindFull) {
+		t.Fatalf("a write past the queue bound = %v, want ErrWriteBehindFull", err)
+	}
+	// It was refused, not queued: the caller owns it, so nothing pretends to.
+	if v, err := s.Get(ctx, tenant, "one-too-many"); !errors.Is(err, cache.ErrNotFound) {
+		t.Fatalf("reading the refused write = %q, %v; want ErrNotFound", v, err)
+	}
+	if err := cache.WithWriteBehindQueue(0)(&cache.Stack{}); err == nil {
+		t.Fatal("WithWriteBehindQueue(0) was accepted")
+	}
+}
+
+// An exact key space must win over a prefix of the same length, whichever was
+// registered first: the patterns tied on length alone, so option order decided
+// which consistency mode a key ran in.
+func TestExactKeySpaceBeatsPrefixOfEqualLength(t *testing.T) {
+	ctx := context.Background()
+	exact := cache.WithKeySpace("user:1234", cache.TTLBounded(11*time.Second))
+	prefix := cache.WithKeySpace("user:1234*", cache.TTLBounded(22*time.Second))
+	for _, c := range []struct {
+		name  string
+		order []cache.Option
+	}{
+		{"exact first", []cache.Option{exact, prefix}},
+		{"prefix first", []cache.Option{prefix, exact}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s, err := cache.New(ctx, append([]cache.Option{cache.WithTier(cache.NewMemory(), time.Hour)}, c.order...)...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+			m, err := s.Mode("user:1234")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := m.Freshness.String(); got != "TTLBounded(11s)" {
+				t.Errorf("the exact key's mode = %s, want the exact key space's TTLBounded(11s)", got)
+			}
+			// A key only the prefix matches still gets the prefix's mode.
+			m, err = s.Mode("user:12345")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := m.Freshness.String(); got != "TTLBounded(22s)" {
+				t.Errorf("a key under the prefix = %s, want TTLBounded(22s)", got)
+			}
+		})
+	}
+}
+
 func TestMemoryLimits(t *testing.T) {
 	ctx := context.Background()
 	m := cache.NewMemory(cache.MaxEntries(2), cache.MaxValueBytes(4))
@@ -237,6 +451,7 @@ type origin struct {
 	loads    atomic.Int32
 	notMod   atomic.Int32
 	delay    time.Duration
+	onLoad   func(key string) // runs before the value is read, to interpose
 }
 
 func newOrigin() *origin {
@@ -246,6 +461,9 @@ func newOrigin() *origin {
 func (o *origin) Load(_ context.Context, key, ifNot string) (cache.Entry, error) {
 	o.loads.Add(1)
 	time.Sleep(o.delay)
+	if o.onLoad != nil {
+		o.onLoad(key)
+	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	v, ok := o.values[key]
@@ -337,8 +555,8 @@ func TestReadThroughFillsEveryTier(t *testing.T) {
 	if err != nil {
 		t.Fatalf("top tier not refilled from bottom: %v", err)
 	}
-	if above.FreshUntil.After(below.FreshUntil) {
-		t.Fatalf("copy above is fresher (%s) than the entry below (%s)", above.FreshUntil, below.FreshUntil)
+	if !above.Confirmed.Equal(below.Confirmed) {
+		t.Fatalf("copy above is confirmed at %s, the entry below at %s: a copy keeps its confirmation", above.Confirmed, below.Confirmed)
 	}
 	if n := o.loads.Load(); n != 1 {
 		t.Fatalf("refill from the bottom tier reached the origin (%d loads)", n)
@@ -438,9 +656,14 @@ func TestWritePolicies(t *testing.T) {
 	})
 	t.Run("Through", func(t *testing.T) {
 		o := newOrigin()
-		s := newStack(t, cache.WithTier(cache.NewMemory(), time.Minute), cache.WithOrigin(o), cache.WithWritePolicy(cache.WriteThrough))
+		s := newStack(t, cache.WithTier(cache.NewMemory(), time.Minute), cache.WithOrigin(o), cache.WithMode(cache.WriteThrough()))
 		if err := s.Set(ctx, tenant, "k", []byte("new")); err != nil {
 			t.Fatal(err)
+		}
+		// The write checks its copy is current with one conditional load,
+		// answered not-modified; the read after it is a hit.
+		if n, notMod := o.loads.Load(), o.notMod.Load(); n != 1 || notMod != 1 {
+			t.Fatalf("the write-through made %d loads (%d not modified), want one conditional check", n, notMod)
 		}
 		e, err := s.GetEntry(ctx, tenant, "k")
 		if err != nil {
@@ -449,7 +672,7 @@ func TestWritePolicies(t *testing.T) {
 		if string(e.Value) != "new" || e.Version != versionOf(1) {
 			t.Fatalf("GetEntry = %+v, want the written value and its origin version", e)
 		}
-		if n := o.loads.Load(); n != 0 {
+		if n := o.loads.Load(); n != 1 {
 			t.Fatalf("write-through read reached the origin %d times", n)
 		}
 	})
@@ -642,8 +865,8 @@ func TestFillOnceDoesNotCrossPartitions(t *testing.T) {
 	origin := viewerOrigin(&loads, 50*time.Millisecond)
 	shared := cache.NewMemory()
 	stacks := []*cache.Stack{
-		newStack(t, cache.WithTier(cache.NewMemory(), time.Minute), cache.WithTier(shared, time.Minute), cache.WithOrigin(origin)),
-		newStack(t, cache.WithTier(cache.NewMemory(), time.Minute), cache.WithTier(shared.Share(), time.Minute), cache.WithOrigin(origin)),
+		newStack(t, cache.WithTier(cache.NewMemory(), time.Minute), cache.WithTier(shared, time.Minute), cache.WithOrigin(origin), cache.WithMode(cache.FillLease())),
+		newStack(t, cache.WithTier(cache.NewMemory(), time.Minute), cache.WithTier(shared.Share(), time.Minute), cache.WithOrigin(origin), cache.WithMode(cache.FillLease())),
 	}
 	viewers := []string{"u", "v", "w"}
 	var wg sync.WaitGroup
@@ -676,7 +899,7 @@ func TestWriteAroundOverStore(t *testing.T) {
 	o.put("k", "old")
 	top, bottom := cache.NewMemory(), cache.NewMemory()
 	s := newStack(t, cache.WithTier(top, time.Minute), cache.WithTier(bottom, time.Minute), cache.WithOrigin(o),
-		cache.WithWritePolicy(cache.WriteThrough))
+		cache.WithMode(cache.WriteThrough()))
 	granted := cache.NewPartition("tenant", cache.WriteAround())
 	assertStoresNoCopy := func(what string) {
 		t.Helper()
@@ -741,8 +964,8 @@ func TestResyncFlushesWhatAGapLost(t *testing.T) {
 		if err := writer.Set(ctx, tenant, "k", []byte("new")); err != nil {
 			t.Fatal(err)
 		}
-		assertGet(t, s, "k", "old") // the notice was lost: the stale copy is served
-	})
+		assertGet(t, s, "k", "old") // the notice was lost, and the gap not yet reported: the stale copy is served
+	}, true)
 	if top.Len() != 0 {
 		t.Fatalf("the resync left %d entries in the tier above", top.Len())
 	}
@@ -814,8 +1037,8 @@ func TestLateMissAfterAnotherProcessFilledLoadsOnce(t *testing.T) {
 	o.delay = 100 * time.Millisecond
 	shared := cache.NewMemory()
 	gate := gatedLayer{Memory: shared.Share(), hold: holdKey{}, missed: make(chan struct{}), release: make(chan struct{})}
-	a := newStack(t, cache.WithTier(shared, time.Hour), cache.WithOrigin(o))
-	b := newStack(t, cache.WithTier(cache.NewMemory(), time.Hour), cache.WithTier(gate, time.Hour), cache.WithOrigin(o))
+	a := newStack(t, cache.WithTier(shared, time.Hour), cache.WithOrigin(o), cache.WithMode(cache.FillLease()))
+	b := newStack(t, cache.WithTier(cache.NewMemory(), time.Hour), cache.WithTier(gate, time.Hour), cache.WithOrigin(o), cache.WithMode(cache.FillLease()))
 
 	// Both processes learn the generation first, so the late reader's miss is
 	// on the copy.
@@ -843,4 +1066,42 @@ func TestLateMissAfterAnotherProcessFilledLoadsOnce(t *testing.T) {
 	if n := o.loads.Load() - loads; n != 1 {
 		t.Fatalf("origin loaded %d times, want 1", n)
 	}
+}
+
+// hookedMemory runs afterSet once a Set of a key it names has landed.
+type hookedMemory struct {
+	*cache.Memory
+	afterSet func(key string)
+}
+
+func (h hookedMemory) Set(ctx context.Context, key string, e cache.Entry, ttl time.Duration) error {
+	err := h.Memory.Set(ctx, key, e, ttl)
+	if h.afterSet != nil {
+		h.afterSet(key)
+	}
+	return err
+}
+
+// A write stores bottom-up. When another process's write, and its notice,
+// land between this write's store in the shared tier and in the tier above,
+// the tier above must not keep this write's value over the newer one: a plain
+// cache's value, here, is what the tier holds.
+func TestWriteRacingANoticeDoesNotLeaveItsValueAbove(t *testing.T) {
+	ctx := context.Background()
+	store := cache.NewMemory()
+	other := newStack(t, cache.WithTier(cache.NewMemory(), time.Hour), cache.WithTier(store.Share(), time.Hour))
+	var once sync.Once
+	hooked := hookedMemory{Memory: store.Share()}
+	hooked.afterSet = func(string) {
+		once.Do(func() {
+			if err := other.Set(ctx, tenant, "k", []byte("newer")); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	s := newStack(t, cache.WithTier(cache.NewMemory(), time.Hour), cache.WithTier(hooked, time.Hour), cache.WithMode(cache.InvalidateOnWrite()))
+	if err := s.Set(ctx, tenant, "k", []byte("older")); err != nil {
+		t.Fatal(err)
+	}
+	assertGet(t, s, "k", "newer")
 }

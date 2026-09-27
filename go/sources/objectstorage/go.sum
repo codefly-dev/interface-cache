@@ -1,7 +1,5 @@
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
 github.com/cespare/xxhash/v2 v2.3.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
-github.com/codefly-dev/interface-cache/go/cache v0.2.0 h1:5NLlV0kRXsOyj4mtmEtfoTmX25RGJhSQVgCwjl4NNnk=
-github.com/codefly-dev/interface-cache/go/cache v0.2.0/go.mod h1:OQDNwz4rpEGfq7VC/FjvmQGlo9H8gH8fIDcZhKIe8iQ=
 github.com/codefly-dev/service-object-storage v0.0.12 h1:/Z3hH+Z/Jr7prfCMNFWaHP+bqUHv/Hzvom+BeNHeUzw=
 github.com/codefly-dev/service-object-storage v0.0.12/go.mod h1:xa5kFlp9LqbjedF/ul5ok3BBJknO2/9f/GxVo+l4AaQ=
 github.com/go-logr/logr v1.4.4 h1:tG4xh9yMsRCAiodLVTxyrkzSZ9+o0L1Kg/+cPVcbP/8=
