@@ -25,6 +25,7 @@ package cache
 import (
 	"context"
 	"errors"
+	"math"
 	"time"
 )
 
@@ -63,17 +64,28 @@ type Entry struct {
 	// Version is the origin's validator for Value (an ETag, a row version).
 	// Empty means the entry cannot be revalidated, only reloaded.
 	Version string
+	// Sequence orders the origin's versions of one key: a Sequenced origin
+	// gives every write, deletes included, a greater one. Zero means
+	// unordered. FillVersionFenced never replaces a copy with one of a lower
+	// sequence.
+	Sequence uint64
 	// Missing marks a negative entry: the origin reported the key absent.
 	Missing bool
-	// FreshUntil is when the entry stops being served without revalidation.
-	// The zero time means fresh for as long as the layer keeps it.
-	FreshUntil time.Time
+	// Confirmed is when the origin last vouched for this value: the start of
+	// the load or revalidation that returned it, or of the write that stored
+	// it. Freshness modes measure a copy's age from it, on the reader's clock;
+	// WithClockSkew bounds how far the writer's clock may differ. The zero
+	// time means never confirmed: only InvalidateOnWrite serves such a copy.
+	Confirmed time.Time
 }
 
-// Fresh reports whether the entry may be served at now without asking the
-// origin.
-func (e Entry) Fresh(now time.Time) bool {
-	return e.FreshUntil.IsZero() || now.Before(e.FreshUntil)
+// Age is how long ago e was confirmed, at now. An entry never confirmed is
+// infinitely old.
+func (e Entry) Age(now time.Time) time.Duration {
+	if e.Confirmed.IsZero() {
+		return time.Duration(math.MaxInt64)
+	}
+	return now.Sub(e.Confirmed)
 }
 
 // Layer holds copies of values. Implementations must be safe for concurrent
@@ -130,17 +142,20 @@ type Notifier interface {
 }
 
 // Resyncer is a Notifier that can lose notices — a dropped connection, a
-// server restart, a full buffer — and signals each gap. On the signal the
-// stack flushes every layer above this one, all partitions and generations
-// alike, because any key may have changed unreported. A Notifier that can lose
+// server restart, a full buffer — and reports each gap. When notices may have
+// stopped (lost), the stack stops serving from and filling the layers above
+// this one and flushes them; once notices flow again (resynced) it flushes
+// them once more and resumes. Both flush every partition and generation,
+// because any key may have changed unreported. A Notifier that can lose
 // notices and does not implement Resyncer breaks the contract: the copies above
 // it would outlive changes until their TTL.
 type Resyncer interface {
 	Notifier
-	// SubscribeResync calls fn after each gap in which notices may have been
-	// lost, once key notices flow again, until stop is called. It returns once
-	// the subscription is active.
-	SubscribeResync(ctx context.Context, fn func()) (stop func(), err error)
+	// SubscribeGaps calls lost when notices may have stopped flowing — within
+	// the layer's declared NoticeBound of the gap's start — and resynced once
+	// they flow again after it, until stop is called. Every resynced follows
+	// a lost. It returns once the subscription is active.
+	SubscribeGaps(ctx context.Context, lost func(), resynced func()) (stop func(), err error)
 }
 
 // Flusher is a Layer that can drop every entry it holds. A layer above a
@@ -155,8 +170,10 @@ type Flusher interface {
 // Source is the authoritative origin under a stack.
 type Source interface {
 	// Load returns the current value for key. When ifNotVersion is non-empty
-	// and still current, it returns ErrNotModified without the value. An
-	// absent key is ErrNotFound.
+	// and still current, an origin that declares ConditionalLoads returns
+	// ErrNotModified without the value. An absent key is ErrNotFound, or, for
+	// a Sequenced origin, an Entry with Missing set carrying the sequence of
+	// the delete.
 	Load(ctx context.Context, key string, ifNotVersion string) (Entry, error)
 }
 
