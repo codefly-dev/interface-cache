@@ -54,6 +54,7 @@ endpoints:
     - name: tcp
       api: tcp
       visibility: public
+      exposure: none
 `,
 		"modules/apps/module.codefly.yaml": "kind: module\nname: apps\nservices:\n    - name: web\n",
 		"modules/apps/services/web/service.codefly.yaml": fmt.Sprintf(`kind: service
