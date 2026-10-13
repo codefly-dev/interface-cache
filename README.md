@@ -30,7 +30,7 @@ adds it to [Drivers](#drivers).
 ## The published definition
 
 `interface.codefly.yaml` publishes **`codefly.dev/cache@0.3.0`** in the format
-core defines (`docs/interfaces.md` in codefly-dev/core, v0.5.10). Core defines
+core defines (`docs/interfaces.md` in codefly-dev/core, v0.19.4). Core defines
 no interface itself: it loads, binds and checks this one without knowing it.
 
 ```yaml
@@ -588,6 +588,6 @@ cd go/sources/objectstorage && go test -race -count=1 -timeout 30m ./...
 simulation's fixed seeds included; see [Simulation](#simulation) for replaying
 a seed and the longer randomized run.
 
-`definition` runs against core v0.5.10's loader and checks, and reads the `v*`
+`definition` runs against core v0.19.4's loader and checks, and reads the `v*`
 tags from git. `go/sources/objectstorage` installs the object-storage gateway at the version
 its `go.mod` pins and runs it on the in-memory backend.

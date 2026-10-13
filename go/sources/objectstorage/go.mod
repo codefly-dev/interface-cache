@@ -1,6 +1,6 @@
 module github.com/codefly-dev/interface-cache/go/sources/objectstorage
 
-go 1.27.0
+go 1.27.2
 
 require (
 	github.com/codefly-dev/interface-cache/go/cache v0.2.0
