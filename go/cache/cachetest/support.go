@@ -350,7 +350,7 @@ func mustAcquire(t *testing.T, l cache.Leaser, key string, ttl time.Duration) ca
 func assertEntry(t *testing.T, key string, got, want cache.Entry) {
 	t.Helper()
 	if !bytes.Equal(got.Value, want.Value) || got.Version != want.Version || got.Sequence != want.Sequence ||
-		got.Missing != want.Missing || !got.Confirmed.Equal(want.Confirmed) {
+		got.Missing != want.Missing || !got.Confirmed.Equal(want.Confirmed) || !got.Expires.Equal(want.Expires) {
 		t.Fatalf("Get(%q) = %+v, want %+v", key, got, want)
 	}
 	if want.Value != nil && got.Value == nil {

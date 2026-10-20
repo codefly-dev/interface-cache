@@ -128,6 +128,15 @@ Keep `-timeout 30m`: the first run installs the object-storage gateway.
 - **A lease is revoked by any write.** `Set`, `Delete` and expiry must all make
   a later `Fill` return `ErrLeaseLost`; `cachetest` holds every driver to it.
   That is what keeps a slow load from caching a value older than the write.
+- **An origin's bound is the origin's; the stack only narrows it.**
+  `Entry.Expires` and `Entry.NoStore` are set by a `Source`, never by the
+  stack, which stamps `Confirmed` alone. `judge` treats a copy at or past
+  `Expires` as stale in every mode and `retention` clamps a tier's TTL to it,
+  never extends it; a `NoStore` value is stored in no tier and gives its lease
+  back. `Expires` travels with the copy, so `Layer/RoundTrip` holds every
+  driver to it: never drop it from `assertEntry` to let a driver pass.
+  `TestOriginExpiresClampsTheTierTTL` and
+  `TestOriginNoStoreIsServedAndKeptNowhere` fail without each of these.
 - **Keep `go/cache` dependency-free.** Anything backend-specific goes in its own
   module. It never imports core or the SDK: a partition key is opaque here.
   What needs core goes in `definition`.

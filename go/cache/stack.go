@@ -734,7 +734,9 @@ func (s *Stack) Get(ctx context.Context, p Partition, key string, opts ...ModeOp
 }
 
 // GetEntry is Get returning the whole entry, version included. A negative
-// entry is returned as an Entry with Missing set, not as an error.
+// entry is returned as an Entry with Missing set, not as an error. A value
+// the origin marked NoStore comes back with the flag set: it was served from
+// the origin and stored in no layer.
 //
 // With an origin, the entry is p's copy under the key's current generation,
 // so a write through any partition — which replaces the generation — is never
@@ -850,10 +852,16 @@ const (
 )
 
 // judge decides whether m may serve e at now. A generation is served for as
-// long as a layer keeps it.
+// long as a layer keeps it. A copy at or past the origin's own bound
+// (Entry.Expires) is stale whatever the mode: the mode bounds how stale a
+// copy may be relative to the origin, and the origin said it stops vouching
+// there.
 func (s *Stack) judge(m Mode, f fill, e Entry, now time.Time) verdict {
 	if f.generation {
 		return serve
+	}
+	if !e.Expires.IsZero() && !now.Add(s.skew).Before(e.Expires) {
+		return stale
 	}
 	age := e.Age(now) + s.skew
 	if e.Confirmed.IsZero() {
@@ -1159,7 +1167,9 @@ func (s *Stack) waitForFill(ctx context.Context, m Mode, f fill, leaser Leaser) 
 // filled under it, and a lost lease means nothing is stored anywhere: the key
 // changed while loading. The tier at skip, if any, is left alone otherwise,
 // since storing there unleased could overwrite a newer value. The entry is
-// confirmed as of the load's start.
+// confirmed as of the load's start. A value the origin marks NoStore, or whose
+// bound has already passed, is returned to the caller and stored nowhere, the
+// lease given back.
 func (s *Stack) loadOrigin(ctx context.Context, m Mode, f fill, old *Entry, skip int, lease *Lease) (Entry, error) {
 	ifNot := ""
 	if old != nil && !old.Missing {
@@ -1170,7 +1180,21 @@ func (s *Stack) loadOrigin(ctx context.Context, m Mode, f fill, old *Entry, skip
 	switch {
 	case err == nil:
 	case errors.Is(err, ErrNotModified) && ifNot != "":
+		// The copy stands, re-confirmed. Its bound is the origin's to renew:
+		// an ErrNotModified carrying an Expires renews it, one without
+		// leaves it as it was.
+		//
+		// A NoStore on that same reply is carried too. It is the origin
+		// confirming the copy for THIS caller and declining to vouch for it
+		// again, so the copy is served and nothing is re-stored: dropping the
+		// flag here would re-confirm the copy for a full retention window,
+		// which is the opposite of what the origin asked for.
+		renewed, noStore := e.Expires, e.NoStore
 		e = *old
+		if !renewed.IsZero() {
+			e.Expires = renewed
+		}
+		e.NoStore = noStore
 	case errors.Is(err, ErrNotFound):
 		e = Entry{Missing: true}
 	default:
@@ -1186,7 +1210,10 @@ func (s *Stack) loadOrigin(ctx context.Context, m Mode, f fill, old *Entry, skip
 	if f.generation {
 		e.Sequence = mintedSequence
 	}
-	if e.Missing && s.negativeTTL <= 0 {
+	if e.NoStore || (e.Missing && s.negativeTTL <= 0) {
+		// Served, stored nowhere: a value the origin vouches for this once
+		// only, or a negative entry with negative caching off. The lease
+		// goes back, so the key is not left leased until the lease expires.
 		if lease != nil {
 			_ = s.tiers[skip].layer.(Leaser).Release(ctx, *lease)
 		}
@@ -1195,13 +1222,19 @@ func (s *Stack) loadOrigin(ctx context.Context, m Mode, f fill, old *Entry, skip
 
 	if lease != nil {
 		t := s.tiers[skip]
-		err := s.fillLeased(ctx, f.since, t, *lease, e, s.retention(t, e))
-		switch {
-		case errors.Is(err, ErrLeaseLost):
-			return e, nil
-		case errors.Is(err, ErrTooLarge):
-		case err != nil:
-			t.breaker.failure()
+		if ttl := s.retention(t, e); ttl <= 0 {
+			// Past the origin's bound on arrival, with no window to
+			// revalidate it in: nothing to fill under the lease.
+			_ = t.layer.(Leaser).Release(ctx, *lease)
+		} else {
+			err := s.fillLeased(ctx, f.since, t, *lease, e, ttl)
+			switch {
+			case errors.Is(err, ErrLeaseLost):
+				return e, nil
+			case errors.Is(err, ErrTooLarge):
+			case err != nil:
+				t.breaker.failure()
+			}
 		}
 	}
 	for i, t := range s.tiers {
@@ -1228,15 +1261,18 @@ func (s *Stack) fillLeased(ctx context.Context, since uint64, t *tier, lease Lea
 }
 
 // fillAbove copies an entry found in tier i into the tiers above it. The copy
-// keeps the entry's confirmation, so it is never fresher than it was below.
+// keeps the entry's confirmation and the origin's bound, so it is never
+// fresher than it was below, and outlives the bound nowhere.
 func (s *Stack) fillAbove(ctx context.Context, m Mode, f fill, i int, e Entry) {
 	for _, t := range s.tiers[:i] {
 		s.store(ctx, m, f, t, e)
 	}
 }
 
-// retention is how long t keeps e: its TTL, jittered, plus the windows in
-// which an expired copy is still useful to revalidate.
+// retention is how long t keeps e: its TTL, jittered, clamped to the origin's
+// bound when the entry carries one — the bound narrows the tier's TTL and
+// never extends it — plus the windows in which an expired copy is still useful
+// to revalidate. Zero or less means the copy is not worth storing.
 func (s *Stack) retention(t *tier, e Entry) time.Duration {
 	ttl := t.ttl
 	if e.Missing {
@@ -1244,6 +1280,9 @@ func (s *Stack) retention(t *tier, e Entry) time.Duration {
 	}
 	if s.jitter > 0 {
 		ttl -= time.Duration(rand.Float64() * s.jitter * float64(ttl))
+	}
+	if !e.Expires.IsZero() {
+		ttl = max(0, min(ttl, e.Expires.Sub(s.clock.Now())))
 	}
 	if !e.Missing {
 		ttl += s.staleWindow + s.swrExtension
@@ -1269,6 +1308,9 @@ func (s *Stack) store(ctx context.Context, m Mode, f fill, t *tier, e Entry) {
 		}
 	}
 	ttl := s.retention(t, e)
+	if ttl <= 0 {
+		return // past the origin's bound already, with no window to revalidate in
+	}
 	var err error
 	if (f.coordinate == CoordinateVersionFenced || m.Fill == CoordinateVersionFenced) && t.caps.Fences {
 		err = t.layer.(Fencer).SetFenced(ctx, f.layer, e, ttl)
