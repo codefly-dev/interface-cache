@@ -113,6 +113,16 @@ Keep `-timeout 30m`: the first run installs the object-storage gateway.
   `RunStack`'s partition cases, run by `TestMemoryStackFillOnce` here and by
   every driver's suite, hold it; a change to the stack's keying must still be
   run against `service-redis/cache`.
+- **The observer never costs a read.** It is called on the operation's own
+  goroutine, so a panic in it is contained in `Stack.report` rather than
+  unwinding into the caller; the event is dropped and the operation goes on.
+- **The observer reports; it never decides.** `WithObserver` events are
+  emitted where the call happens (`read`, `validated`, `usable`, `loadShared`,
+  `loadFrom`, `loadAround`, `write`, `setAll`, `invalidate`, `drain`),
+  synchronously, and never for a generation fill. A new tier or origin call
+  site reports its outcome the same way, through `observe` or `report`, which
+  cost nothing when `s.observer` is nil. No counters, no stats, no metric
+  names here: the consumer aggregates, at the cardinality it chooses.
 - **A write reaches every partition through the key's generation.** Read the
   generation before loading the origin, store every copy under it, and replace
   it on every write; never mint one over an existing generation (the lease
