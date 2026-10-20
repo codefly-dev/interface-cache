@@ -834,7 +834,10 @@ func (s *sim) crash(p *simProc) {
 // the origin.
 func (s *sim) finish() {
 	for _, p := range s.procs {
-		p.shared.deliver(false, false, true)
+		// A layer whose notices arrive on their own schedule stays held:
+		// released, a late one would run on the layer's goroutine against
+		// the oracle's state while this delivers.
+		p.shared.deliver(false, false, cache.CapabilitiesOf(p.shared.inner).NoticeBound == cache.NoticesBeforeReturn)
 		s.draining = p
 		p.tasks.runAll()
 		s.draining = nil
