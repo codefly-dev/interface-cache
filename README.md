@@ -17,7 +17,7 @@ runtime. Roadmap: [codefly-dev/.github#7](https://github.com/codefly-dev/.github
 |---|---|
 | `interface.codefly.yaml` | The published definition, `codefly.dev/cache@0.3.0`, in core's format: type `capability`, the `cache` configuration group (`driver`; `connection`, secret). Providers are held to it. See [The published definition](#the-published-definition). |
 | `definition` | A module of its own that holds the definition to core's checks (core's loader, the Go constants, a provider's emitted configuration, evolution between published versions), so `go/cache` never depends on core. `definition/published/` records every published version. |
-| `go/cache` | `Layer`, `Source`, `Store`, `Partition`, the `Stack` (any number of layers), [consistency modes](#consistency-modes) and `Capabilities`, `Open` + driver registry, `Typed[T]`, and `Memory`: a complete in-process backend that declares every layer capability (leases, notifications, flush, fenced fills, a byte budget; `Share()` gives several stacks one store). Depends on nothing but `golang.org/x/sync`. |
+| `go/cache` | `Layer`, `Source`, `Store`, `Partition`, the `Stack` (any number of layers), [consistency modes](#consistency-modes) and `Capabilities`, [`WithObserver` events](#observability), `Open` + driver registry, `Typed[T]`, and `Memory`: a complete in-process backend that declares every layer capability (leases, notifications, flush, fenced fills, a byte budget; `Share()` gives several stacks one store). Depends on nothing but `golang.org/x/sync`. |
 | `go/cache/cachetest` | Conformance suite: `Run` (the Layer contract, the layer's declared `Capabilities` against its behaviour: Leaser, Notifier, Resyncer, Fencer, byte budget) and `RunStack` (fill-once across processes, partition isolation, eviction on external writes and resyncs, a property test per mode, every [pitfall](#pitfalls) as a scenario, and the [simulation](#simulation)). A harness may provide `ExternalWrite` (change a key bypassing the driver) and must provide `Interrupt` for a Resyncer. Benchmarks per mode are in its tests. |
 | `go/sources/objectstorage` | Origin adapter over the object-storage gateway client: loads conditional on ETag (it declares `ConditionalLoads`, so it keeps `Validated`). Safe only behind the consumer's own authorization check (see [Partitions](#partitions-and-authorization)). |
 
@@ -424,6 +424,45 @@ CACHETEST_SIM_RUNS=50 CACHETEST_SIM_STEPS=5000 go test -run 'TestMemoryStackFill
 
 `CACHETEST_SIM_LOG=1` prints every operation of a failing run instead of the
 last 60.
+
+## Observability
+
+A stack reports what it did, as it does it, to the function given to
+`WithObserver`. Each `Event` is one thing that happened at one tier or at the
+origin during one operation:
+
+| Field | |
+|---|---|
+| `Op` | `OpGet`; `OpRefresh`, a `StaleWhileRevalidate` refresh in the background; `OpSet`, `OpDelete`, `OpInvalidate` |
+| `Key`, `LayerKey` | the caller's key, and the key as the tier saw it (schema, partition and generation included), or the generation key a write replaced; empty for a write reaching the origin |
+| `Tier` | the tier's index, top first, or `cache.Origin` |
+| `Outcome` | below |
+| `Err` | the error behind `Failed` |
+| `Elapsed` | the tier's or the origin's call, or the wait for another process's fill |
+
+| Outcome | Reported when |
+|---|---|
+| `Hit`, `Stale`, `Miss` | a tier held a copy the read used, one too old for the mode, or nothing |
+| `SkippedBreaker`, `SkippedGap`, `SkippedQuarantine` | a tier was not consulted: its breaker is open, a notifier below it is in a gap, or it missed an invalidation not yet replayed there |
+| `Failed` | a tier or the origin returned an error |
+| `Loaded`, `NotModified`, `NotFound` | this process loaded the origin, and what it answered |
+| `Waited` | another process held the fill lease; this one waited for its fill and got it |
+| `Written` | the origin took a write, or a tier took the value or the key's new generation |
+
+The questions a tiered stack raises are each one event apart: which tier
+answered (`Hit` on tier 0 or on tier 1); whether this process loaded the
+origin (`Loaded`) or waited on another process's lease (`Waited`); whether a
+layer is being skipped (`SkippedBreaker`); and cold against down, which a
+plain cache's `ErrMiss` hides: a tier that held nothing (`Miss`) and one that
+could not be reached (`Failed`, with the error) are different events.
+
+The observer runs on the goroutine doing the operation, so it must be quick,
+must not block and must not call the stack; feed a metrics backend from it.
+Keys are passed as they are: what to aggregate on, and at what cardinality, is
+the consumer's decision. The generation reads that precede every read over an
+origin are bookkeeping and are not reported. Without `WithObserver` nothing is
+reported and nothing is spent. The hook is additive, since 0.3.0: a stack
+without one behaves as before.
 
 ## Semantics
 

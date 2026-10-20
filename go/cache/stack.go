@@ -51,6 +51,7 @@ type Stack struct {
 	run             func(task func())
 	behindErrors    func(key string, err error)
 	behindQueue     int
+	observer        func(Event)
 	leaseTTLSet     bool // WithLeaseTTL was given, so it does not follow loadTimeout
 	// mint is how a missing generation is minted: with a lease when a tier
 	// grants them, fenced when every tier fences, else unguarded.
@@ -491,7 +492,7 @@ func (s *Stack) subscribe(ctx context.Context) error {
 	}
 	if s.originCaps.ChangeFeed {
 		stop, err := s.origin.(ChangeFeed).SubscribeChanges(ctx, func(key string) {
-			_, _ = s.bump(context.Background(), key)
+			_, _ = s.bump(context.Background(), OpInvalidate, key)
 		})
 		if err != nil {
 			return fmt.Errorf("cache: subscribe to the origin's changes: %w", err)
@@ -816,6 +817,8 @@ type fill struct {
 	op *operation
 	// coordinate is how concurrent loads of layer are shared.
 	coordinate FillCoordination
+	// kind is the operation the fill serves, named in its events.
+	kind Operation
 	// generation marks a generation's layer key: any copy a layer still keeps
 	// is current, whatever its age.
 	generation bool
@@ -883,19 +886,27 @@ func (s *Stack) judge(m Mode, f fill, e Entry, now time.Time) verdict {
 	return stale
 }
 
-// usable reports whether a read may consult t now. A tier in a notifier's gap
-// is skipped silently: skipping it cannot make a read staler. A failing or
-// quarantined one is skipped under Degrade and refused under FailClosed.
-func (s *Stack) usable(ctx context.Context, i int, m Mode) (bool, error) {
+// usable reports whether a read of f may consult t now, and reports a tier it
+// skips. A tier in a notifier's gap is skipped silently: skipping it cannot
+// make a read staler. A failing or quarantined one is skipped under Degrade
+// and refused under FailClosed.
+func (s *Stack) usable(ctx context.Context, i int, m Mode, f fill) (bool, error) {
 	t := s.tiers[i]
-	if t.gaps.Load() > 0 {
+	switch {
+	case t.gaps.Load() > 0:
+		s.observe(f, i, SkippedGap, nil, time.Time{})
 		return false, nil
+	case !t.breaker.allow():
+		s.observe(f, i, SkippedBreaker, nil, time.Time{})
+	case !s.recover(ctx, t):
+		s.observe(f, i, SkippedQuarantine, nil, time.Time{})
+	default:
+		return true, nil
 	}
-	ok := t.breaker.allow() && s.recover(ctx, t)
-	if !ok && m.Failure == FailClosedPolicy {
+	if m.Failure == FailClosedPolicy {
 		return false, fmt.Errorf("%w: tier %d (%T) is failing or missed an invalidation", ErrUnavailable, i, t.layer)
 	}
-	return ok, nil
+	return false, nil
 }
 
 // read walks the tiers top-down for f.layer, and loads it on a miss.
@@ -903,20 +914,23 @@ func (s *Stack) read(ctx context.Context, m Mode, f fill) (Entry, error) {
 	now := s.clock.Now()
 	var old *Entry
 	for i, t := range s.tiers {
-		ok, err := s.usable(ctx, i, m)
+		ok, err := s.usable(ctx, i, m, f)
 		if err != nil {
 			return Entry{}, err
 		}
 		if !ok {
 			continue
 		}
+		start := s.timing()
 		e, err := t.layer.Get(ctx, f.layer)
 		if errors.Is(err, ErrMiss) {
 			t.breaker.success()
+			s.observe(f, i, Miss, nil, start)
 			continue
 		}
 		if err != nil {
 			t.breaker.failure()
+			s.observe(f, i, Failed, err, start)
 			if m.Failure == FailClosedPolicy {
 				return Entry{}, fmt.Errorf("%w: tier %d (%T): %w", ErrUnavailable, i, t.layer, err)
 			}
@@ -925,13 +939,16 @@ func (s *Stack) read(ctx context.Context, m Mode, f fill) (Entry, error) {
 		t.breaker.success()
 		switch s.judge(m, f, e, now) {
 		case serve:
+			s.observe(f, i, Hit, nil, start)
 			s.fillAbove(ctx, m, f, i, e)
 			return e, nil
 		case serveAndRefresh:
+			s.observe(f, i, Hit, nil, start)
 			s.fillAbove(ctx, m, f, i, e)
 			s.refresh(m, f, e)
 			return e, nil
 		}
+		s.observe(f, i, Stale, nil, start)
 		if old == nil {
 			old = &e
 		}
@@ -951,6 +968,7 @@ func (s *Stack) refresh(m Mode, f fill, e Entry) {
 			// landed in between is already in what it loads, and voiding the
 			// refresh for it would drop a current value.
 			f := f
+			f.kind = OpRefresh
 			f.op = s.inflight.begin(keyOf(f.layer))
 			defer s.done(f)
 			ctx, cancel := context.WithTimeout(context.Background(), s.loadTimeout)
@@ -971,26 +989,30 @@ func (s *Stack) refresh(m Mode, f fill, e Entry) {
 func (s *Stack) validated(ctx context.Context, m Mode, f fill) (Entry, error) {
 	var found *Entry
 	for i, t := range s.tiers {
-		ok, err := s.usable(ctx, i, m)
+		ok, err := s.usable(ctx, i, m, f)
 		if err != nil {
 			return Entry{}, err
 		}
 		if !ok {
 			continue
 		}
+		start := s.timing()
 		e, err := t.layer.Get(ctx, f.layer)
 		if errors.Is(err, ErrMiss) {
 			t.breaker.success()
+			s.observe(f, i, Miss, nil, start)
 			continue
 		}
 		if err != nil {
 			t.breaker.failure()
+			s.observe(f, i, Failed, err, start)
 			if m.Failure == FailClosedPolicy {
 				return Entry{}, fmt.Errorf("%w: tier %d (%T): %w", ErrUnavailable, i, t.layer, err)
 			}
 			continue
 		}
 		t.breaker.success()
+		s.observe(f, i, Hit, nil, start)
 		found = &e
 		break
 	}
@@ -1054,10 +1076,31 @@ func (s *Stack) loadAround(ctx context.Context, key string) (Entry, error) {
 	defer cancel()
 	start := s.clock.Now()
 	e, err := s.origin.Load(lctx, key, "")
+	s.report(Event{Op: OpGet, Key: key, Tier: Origin, Outcome: loaded(err), Err: err}, start)
 	if errors.Is(err, ErrNotFound) {
 		return Entry{Missing: true, Confirmed: start}, nil
 	}
 	e.Confirmed = start
+	return e, err
+}
+
+// loaded is the outcome of an origin load that returned err.
+func loaded(err error) Outcome {
+	switch {
+	case err == nil:
+		return Loaded
+	case errors.Is(err, ErrNotModified):
+		return NotModified
+	case errors.Is(err, ErrNotFound):
+		return NotFound
+	}
+	return Failed
+}
+
+// loadFrom loads f from the origin and reports the outcome.
+func (s *Stack) loadFrom(ctx context.Context, f fill, ifNot string, start time.Time) (Entry, error) {
+	e, err := f.load(ctx, ifNot)
+	s.observe(f, Origin, loaded(err), err, start)
 	return e, err
 }
 
@@ -1101,15 +1144,18 @@ func (s *Stack) loadShared(ctx context.Context, m Mode, f fill, old *Entry) (Ent
 		lease, ok, err := leaser.Acquire(ctx, f.layer, s.leaseTTL)
 		if err != nil {
 			t.breaker.failure()
+			s.observe(f, idx, Failed, err, time.Time{})
 			return s.loadOrigin(ctx, m, f, old, idx, nil)
 		}
 		if ok {
 			// Another process may have filled the key between this one's miss
 			// and its lease. Use that fill: loading again would replace a
 			// generation, orphaning every copy made under it.
+			start := s.timing()
 			if e, err := leaser.Get(ctx, f.layer); err == nil {
 				if s.judge(m, f, e, s.clock.Now()) != stale {
 					_ = leaser.Release(ctx, lease)
+					s.observe(f, idx, Hit, nil, start)
 					s.fillAbove(ctx, m, f, idx, e)
 					return e, nil
 				}
@@ -1119,11 +1165,13 @@ func (s *Stack) loadShared(ctx context.Context, m Mode, f fill, old *Entry) (Ent
 			}
 			return s.loadOrigin(ctx, m, f, old, idx, &lease)
 		}
+		start := s.timing()
 		e, filled, err := s.waitForFill(ctx, m, f, leaser)
 		if err != nil {
 			return Entry{}, err
 		}
 		if filled {
+			s.observe(f, idx, Waited, nil, start)
 			s.fillAbove(ctx, m, f, idx, e)
 			return e, nil
 		}
@@ -1166,7 +1214,7 @@ func (s *Stack) loadOrigin(ctx context.Context, m Mode, f fill, old *Entry, skip
 		ifNot = old.Version
 	}
 	start := s.clock.Now()
-	e, err := f.load(ctx, ifNot)
+	e, err := s.loadFrom(ctx, f, ifNot, start)
 	switch {
 	case err == nil:
 	case errors.Is(err, ErrNotModified) && ifNot != "":
@@ -1352,12 +1400,13 @@ func (s *Stack) write(ctx context.Context, p Partition, key string, value []byte
 		return err
 	}
 	s.heal(ctx)
+	op := opOf(del)
 	if s.origin == nil {
 		layerKey := p.layerKey(s.schema, key)
 		if del || p.writeAround {
-			return s.invalidate(ctx, layerKey)
+			return s.invalidate(ctx, op, layerKey)
 		}
-		return s.setAll(ctx, layerKey, Entry{Value: value, Confirmed: s.clock.Now()})
+		return s.setAll(ctx, op, layerKey, Entry{Value: value, Confirmed: s.clock.Now()})
 	}
 	store, ok := s.origin.(Store)
 	if !ok {
@@ -1367,7 +1416,7 @@ func (s *Stack) write(ctx context.Context, p Partition, key string, value []byte
 		return s.behind.enqueue(s, p, key, value, del)
 	}
 	if m.Failure == FailClosedPolicy && m.Write != PropagateOriginOnly {
-		if _, err := s.bump(ctx, key); err != nil {
+		if _, err := s.bump(ctx, op, key); err != nil {
 			return fmt.Errorf("%w: the origin was not written: %w", ErrUnavailable, err)
 		}
 	}
@@ -1378,6 +1427,7 @@ func (s *Stack) write(ctx context.Context, p Partition, key string, value []byte
 	} else {
 		version, err = store.Put(ctx, key, value)
 	}
+	s.report(Event{Op: op, Key: key, Tier: Origin, Outcome: written(err), Err: err}, start)
 	if err != nil {
 		return err
 	}
@@ -1385,7 +1435,7 @@ func (s *Stack) write(ctx context.Context, p Partition, key string, value []byte
 	if m.Write == PropagateOriginOnly {
 		return nil
 	}
-	generation, err := s.bump(ctx, key)
+	generation, err := s.bump(ctx, op, key)
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrPartialWrite, err)
 	}
@@ -1398,6 +1448,7 @@ func (s *Stack) write(ctx context.Context, p Partition, key string, value []byte
 	// Unchanged, that transfers nothing; changed, the copy is the newer value.
 	f := s.newFill(p.entryKey(s.schema, generation, key), s.since(), m.Fill)
 	defer s.done(f)
+	f.kind = op
 	f.load = func(ctx context.Context, ifNot string) (Entry, error) { return store.Load(ctx, key, ifNot) }
 	written := Entry{Value: value, Version: version}
 	if _, err := s.revalidate(ctx, m, f, &written); err != nil {
@@ -1422,12 +1473,12 @@ func (s *Stack) ownWindow() time.Duration {
 // every failure always returned. What differs is what the caller does with
 // that: Stack.write bumps before the origin under FailClosed and gives up with
 // the origin untouched, and reports ErrPartialWrite under Degrade.
-func (s *Stack) bump(ctx context.Context, key string) (string, error) {
+func (s *Stack) bump(ctx context.Context, op Operation, key string) (string, error) {
 	if len(s.tiers) == 0 {
 		return "", nil
 	}
 	g := newGeneration()
-	return g, s.setAll(ctx, generationKey(key), Entry{Value: []byte(g), Version: g, Sequence: bumpedSequence, Confirmed: s.clock.Now()})
+	return g, s.setAll(ctx, op, generationKey(key), Entry{Value: []byte(g), Version: g, Sequence: bumpedSequence, Confirmed: s.clock.Now()})
 }
 
 // setAll stores e under layerKey in every layer, bottom-up, so a layer above
@@ -1435,7 +1486,7 @@ func (s *Stack) bump(ctx context.Context, key string) (string, error) {
 // quarantined for layerKey. A layer above one that another write, or a
 // notice, touched while this one was under way is emptied of layerKey rather
 // than left holding this write's version over that one's.
-func (s *Stack) setAll(ctx context.Context, layerKey string, e Entry) error {
+func (s *Stack) setAll(ctx context.Context, kind Operation, layerKey string, e Entry) error {
 	// This write is an operation of its own, so the touches below void the
 	// fills racing it without voiding it. The second touch, after the loop,
 	// catches a fill that registered while this write was under way.
@@ -1445,7 +1496,9 @@ func (s *Stack) setAll(ctx context.Context, layerKey string, e Entry) error {
 	var errs []error
 	for i := len(s.tiers) - 1; i >= 0; i-- {
 		t := s.tiers[i]
+		start := s.timing()
 		err := t.layer.Set(ctx, layerKey, e, s.retention(t, e))
+		s.report(Event{Op: kind, Key: keyOf(layerKey), LayerKey: layerKey, Tier: i, Outcome: written(err), Err: err}, start)
 		switch {
 		case err == nil:
 			t.quarantine.clear(layerKey)
@@ -1480,20 +1533,23 @@ func (s *Stack) Invalidate(ctx context.Context, p Partition, key string) error {
 		return err
 	}
 	if s.origin == nil {
-		return s.invalidate(ctx, p.layerKey(s.schema, key))
+		return s.invalidate(ctx, OpInvalidate, p.layerKey(s.schema, key))
 	}
-	_, err := s.bump(ctx, key)
+	_, err := s.bump(ctx, OpInvalidate, key)
 	return err
 }
 
-func (s *Stack) invalidate(ctx context.Context, layerKey string) error {
+func (s *Stack) invalidate(ctx context.Context, kind Operation, layerKey string) error {
 	op := s.inflight.begin(keyOf(layerKey))
 	defer s.inflight.end(op)
 	s.touch(layerKey, op)
 	var errs []error
 	for i := len(s.tiers) - 1; i >= 0; i-- {
 		t := s.tiers[i]
-		if err := t.layer.Delete(ctx, layerKey); err != nil {
+		start := s.timing()
+		err := t.layer.Delete(ctx, layerKey)
+		s.report(Event{Op: kind, Key: keyOf(layerKey), LayerKey: layerKey, Tier: i, Outcome: written(err), Err: err}, start)
+		if err != nil {
 			t.breaker.failure()
 			t.quarantine.add(layerKey, s.clock.Now())
 			errs = append(errs, fmt.Errorf("tier %d: %w", i, err))
@@ -1796,6 +1852,7 @@ func (w *writeBehind) drain(s *Stack) {
 		ctx, cancel := context.WithTimeout(context.Background(), s.loadTimeout)
 		var err error
 		var version string
+		start := s.timing()
 		for attempt := range 5 {
 			if attempt > 0 {
 				_ = s.clock.Sleep(ctx, time.Duration(attempt)*50*time.Millisecond)
@@ -1809,9 +1866,10 @@ func (w *writeBehind) drain(s *Stack) {
 				break
 			}
 		}
+		s.report(Event{Op: opOf(bw.del), Key: bw.key, Tier: Origin, Outcome: written(err), Err: err}, start)
 		if err == nil {
 			s.own.record(bw.key, version, bw.del, bw.at, s.ownWindow())
-			_, _ = s.bump(ctx, bw.key)
+			_, _ = s.bump(ctx, opOf(bw.del), bw.key)
 		}
 		cancel()
 
