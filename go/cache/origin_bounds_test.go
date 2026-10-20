@@ -262,3 +262,38 @@ func TestNotModifiedRenewsTheOriginsBound(t *testing.T) {
 		t.Fatalf("origin loaded %d times, want %d: every revalidation was conditional", n, 1+notMod)
 	}
 }
+
+// An ErrNotModified carrying NoStore confirms the copy for this caller alone:
+// it is served, and nothing is re-stored, so the next reader revalidates
+// again. Dropping the flag on that reply re-confirmed the copy for a full
+// retention window — the opposite of what the origin asked for.
+func TestNotModifiedWithNoStoreDoesNotReconfirmTheCopy(t *testing.T) {
+	clock := newTestClock()
+	o := newOrigin()
+	o.put("k", "v")
+	src := cache.SourceFunc(func(ctx context.Context, key, ifNot string) (cache.Entry, error) {
+		e, err := o.Load(ctx, key, ifNot)
+		if errors.Is(err, cache.ErrNotModified) {
+			return cache.Entry{NoStore: true}, err
+		}
+		return e, err
+	})
+	top := cache.NewMemory(cache.MemoryClock(clock.Now))
+	s := newStack(t, cache.WithClock(clock), cache.WithTier(top, time.Minute),
+		cache.WithMode(cache.TTLBounded(time.Second)), cache.WithStaleWindow(time.Hour),
+		cache.WithOrigin(src))
+
+	assertGet(t, s, "k", "v")
+	clock.Advance(2 * time.Second)
+
+	// Both reads find a copy older than the bound, so both must revalidate:
+	// the first reply declined to be stored, so it left the copy as it was.
+	assertGet(t, s, "k", "v")
+	assertGet(t, s, "k", "v")
+	if n := o.notMod.Load(); n != 2 {
+		t.Fatalf("the copy was revalidated %d times over two reads past the bound, want 2: a NoStore reply re-confirmed it", n)
+	}
+	if n, notMod := o.loads.Load(), o.notMod.Load(); n != 1+notMod {
+		t.Fatalf("origin was called %d times for %d revalidations, want %d: one of them was not conditional", n, notMod, 1+notMod)
+	}
+}

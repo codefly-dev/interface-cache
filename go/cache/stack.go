@@ -1183,11 +1183,18 @@ func (s *Stack) loadOrigin(ctx context.Context, m Mode, f fill, old *Entry, skip
 		// The copy stands, re-confirmed. Its bound is the origin's to renew:
 		// an ErrNotModified carrying an Expires renews it, one without
 		// leaves it as it was.
-		renewed := e.Expires
+		//
+		// A NoStore on that same reply is carried too. It is the origin
+		// confirming the copy for THIS caller and declining to vouch for it
+		// again, so the copy is served and nothing is re-stored: dropping the
+		// flag here would re-confirm the copy for a full retention window,
+		// which is the opposite of what the origin asked for.
+		renewed, noStore := e.Expires, e.NoStore
 		e = *old
 		if !renewed.IsZero() {
 			e.Expires = renewed
 		}
+		e.NoStore = noStore
 	case errors.Is(err, ErrNotFound):
 		e = Entry{Missing: true}
 	default:

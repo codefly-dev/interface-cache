@@ -195,7 +195,9 @@ type Source interface {
 	// ErrNotModified without the value; it may return an Entry carrying only
 	// a new Expires with it, which renews the bound on the copy the stack
 	// holds — without one, ErrNotModified renews the copy's confirmation and
-	// leaves its bound as it was. An absent key is ErrNotFound, or, for a
+	// leaves its bound as it was. A NoStore on that reply confirms the copy
+	// for this caller alone: it is served and nothing is re-stored, so the
+	// next reader revalidates again. An absent key is ErrNotFound, or, for a
 	// Sequenced origin, an Entry with Missing set carrying the sequence of
 	// the delete. An origin bounds a value's validity with Entry.Expires, and
 	// serves one without caching it with Entry.NoStore.
