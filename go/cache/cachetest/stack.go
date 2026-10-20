@@ -84,7 +84,7 @@ func runResyncFlushes(t *testing.T, h Harness) {
 	// once every notice of the writes above has been delivered does a copy
 	// stay put, so wait for that, then fill the in-process tiers by reading,
 	// which notifies no one.
-	drainNotices(t, h, ns, p, plain)
+	drainNotices(t, h, ns, p.shared, plain.shared)
 	for _, x := range []process{p, plain} {
 		for _, viewer := range viewers {
 			_, _ = x.stack.Get(asViewer(viewer), partitionOf(viewer), "k")
@@ -472,11 +472,11 @@ func newProcess(t *testing.T, h Harness, namespace string, opts ...cache.Option)
 }
 
 // drainNotices waits until every notice of the writes made so far in
-// namespace has reached each process's stack. A server delivers its notices in
+// namespace has reached each recorder's stack. A server delivers its notices in
 // order, so once a stack has heard markers written after them, it has heard
 // them. The markers span many keys, so that on a server of several shards
 // every shard's stream is drained too.
-func drainNotices(t *testing.T, h Harness, namespace string, processes ...process) {
+func drainNotices(t *testing.T, h Harness, namespace string, recorders ...*recorder) {
 	t.Helper()
 	writer := h.New(t, namespace)
 	if !cache.CapabilitiesOf(writer).Notifies {
@@ -487,8 +487,8 @@ func drainNotices(t *testing.T, h Harness, namespace string, processes ...proces
 		markers[i] = fmt.Sprintf("drain-%s-%d", Namespace(t), i)
 		mustSet(t, writer, markers[i], cache.Entry{Value: []byte("marker")}, time.Minute)
 	}
-	for _, x := range processes {
-		eventually(t, 10*time.Second, func() bool { return x.shared.heardAll(markers) },
+	for _, r := range recorders {
+		eventually(t, 10*time.Second, func() bool { return r.heardAll(markers) },
 			"the stack never heard notices written after the ones it is waiting for")
 	}
 }
@@ -498,16 +498,24 @@ func drainNotices(t *testing.T, h Harness, namespace string, processes ...proces
 // heard a later one, it has heard the earlier ones.
 func settle(t *testing.T, a, b process) {
 	t.Helper()
+	settleStacks(t, a.stack, b.stack)
+}
+
+// settleStacks is settle over two stacks sharing a namespace: b has heard
+// every notice its own layer published before the marker, its own writes'
+// echoes included, once it serves a's write of the marker.
+func settleStacks(t *testing.T, a, b *cache.Stack) {
+	t.Helper()
 	ctx := context.Background()
 	marker, key := cache.NewPartition(Namespace(t)), "settle"
-	if err := b.stack.Set(ctx, marker, key, []byte("before")); err != nil {
+	if err := b.Set(ctx, marker, key, []byte("before")); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.stack.Set(ctx, marker, key, []byte("after")); err != nil {
+	if err := a.Set(ctx, marker, key, []byte("after")); err != nil {
 		t.Fatal(err)
 	}
 	eventually(t, 3*time.Second, func() bool {
-		got, err := b.stack.Get(ctx, marker, key)
+		got, err := b.Get(ctx, marker, key)
 		return err == nil && string(got) == "after"
 	}, "the other process never heard a's notices")
 }

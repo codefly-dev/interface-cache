@@ -183,6 +183,11 @@ func runFreshness(t *testing.T, h Harness, caps cache.Capabilities) {
 		w.origin.put("k", "one")
 		a, rec, top := w.process(t)
 		wantString(t, a, tenantU, "k", "one")
+		// The layer may echo the fill above, later: let every notice of it
+		// land, then fill the Memory tier again by reading, which notifies
+		// no one, so that its size is the bypass read's to keep.
+		drainNotices(t, h, w.ns, rec)
+		wantString(t, a, tenantU, "k", "one")
 		w.origin.put("k", "two")
 		rec.reset()
 		entries := top.Len()

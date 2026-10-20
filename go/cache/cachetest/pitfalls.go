@@ -200,6 +200,11 @@ func runInvalidations(t *testing.T, h Harness, caps cache.Capabilities) {
 		top := cache.NewMemory(cache.MemoryClock(w.clock.Now))
 		b := stackOf(t, top, shared, w.origin, w.clock, nil)
 		wantString(t, b, tenantU, "k", "one")
+		// The layer may echo b's fill, later, and evict the copy it stored
+		// above: let that land, then fill the tier again by reading, which
+		// notifies no one, so the copy is there for the scenario to evict.
+		settleStacks(t, a, b)
+		wantString(t, b, tenantU, "k", "one")
 		return w, a, b, shared, top
 	}
 	t.Run("LostInAGap", func(t *testing.T) {
