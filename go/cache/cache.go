@@ -77,6 +77,26 @@ type Entry struct {
 	// WithClockSkew bounds how far the writer's clock may differ. The zero
 	// time means never confirmed: only InvalidateOnWrite serves such a copy.
 	Confirmed time.Time
+	// Expires is the origin's own bound on Value, for a value whose validity
+	// the origin knows (a credential, a lease, a value with an upstream
+	// expiry): the stack never serves a copy at or past it without
+	// revalidating, whatever the mode's freshness bound, and no layer keeps
+	// one past it except within WithStaleWindow, to revalidate. The bound
+	// only ever narrows a tier's TTL, never extends it, and travels with the
+	// copy through every layer. Only an origin sets it; the stack never does.
+	// The zero time means the origin sets no bound: the mode's alone applies.
+	// A past Expires is a value stale on arrival, served to the caller that
+	// loaded it and kept only to revalidate; to serve a value and keep it
+	// nowhere, set NoStore.
+	Expires time.Time
+	// NoStore marks a value the origin vouches for this once only: the stack
+	// returns it to the caller and stores it in no layer, releasing any fill
+	// lease it holds. It is for a value that is correct to serve and wrong to
+	// keep — bytes whose recorded length disagrees with what was read, a
+	// reply the origin cannot stand behind later — where failing the read
+	// would be the alternative. Only an origin sets it; a layer never sees
+	// one.
+	NoStore bool
 }
 
 // Age is how long ago e was confirmed, at now. An entry never confirmed is
@@ -88,8 +108,9 @@ func (e Entry) Age(now time.Time) time.Duration {
 	return now.Sub(e.Confirmed)
 }
 
-// Layer holds copies of values. Implementations must be safe for concurrent
-// use.
+// Layer holds copies of values. It stores an Entry whole — Value, Version,
+// Sequence, Missing, Confirmed and Expires — and returns it as stored; NoStore
+// never reaches it. Implementations must be safe for concurrent use.
 type Layer interface {
 	// Get returns the entry for key, or ErrMiss.
 	Get(ctx context.Context, key string) (Entry, error)
@@ -171,9 +192,13 @@ type Flusher interface {
 type Source interface {
 	// Load returns the current value for key. When ifNotVersion is non-empty
 	// and still current, an origin that declares ConditionalLoads returns
-	// ErrNotModified without the value. An absent key is ErrNotFound, or, for
-	// a Sequenced origin, an Entry with Missing set carrying the sequence of
-	// the delete.
+	// ErrNotModified without the value; it may return an Entry carrying only
+	// a new Expires with it, which renews the bound on the copy the stack
+	// holds — without one, ErrNotModified renews the copy's confirmation and
+	// leaves its bound as it was. An absent key is ErrNotFound, or, for a
+	// Sequenced origin, an Entry with Missing set carrying the sequence of
+	// the delete. An origin bounds a value's validity with Entry.Expires, and
+	// serves one without caching it with Entry.NoStore.
 	Load(ctx context.Context, key string, ifNotVersion string) (Entry, error)
 }
 

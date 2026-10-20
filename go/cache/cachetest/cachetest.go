@@ -193,6 +193,7 @@ func runLayer(t *testing.T, h Harness) {
 			"binary":              {Value: []byte{0, 1, 2, 0xff, 0}, Version: "v1", Confirmed: confirmed},
 			"empty":               {Value: []byte{}, Version: "v2", Sequence: 1<<63 + 7},
 			"negative":            {Missing: true, Confirmed: confirmed, Sequence: 3},
+			"bounded":             {Value: []byte("until"), Version: "v3", Confirmed: confirmed, Expires: confirmed.Add(2 * time.Hour)},
 			"no-meta":             {Value: []byte("plain")},
 			"k:with/odd {chars}}": {Value: []byte("odd key"), Version: `"etag-1"`},
 		}

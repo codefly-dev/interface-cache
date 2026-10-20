@@ -249,7 +249,10 @@ operation on `key` runs in, or why the stack cannot keep it.
 
 A copy's age is measured from `Entry.Confirmed`, the start of the load,
 revalidation or write that last vouched for it, on the reader's clock plus
-`WithClockSkew`.
+`WithClockSkew`. An origin that knows a value's own bound sets
+`Entry.Expires`: a copy at or past it is stale in every mode, whatever the
+mode's bound, and no layer keeps one past it (plus `WithStaleWindow`, to
+revalidate). The bound narrows a tier's TTL and never extends it.
 
 | Mode | Guarantee (checked property) | Needs | Property test |
 |---|---|---|---|
@@ -429,6 +432,24 @@ last 60.
 
 - **Reads** walk the layers top-down and fill the ones above a hit, never
   fresher than the entry was below.
+- **An origin's own bound.** `Entry.Expires`, set by the origin only — for a
+  credential, a lease, a value with an upstream expiry — is honoured in every
+  mode: a copy at or past it is revalidated or reloaded before it is served,
+  every tier's TTL is clamped to it and never extended by it, and the bound
+  travels with the copy through every layer, so a driver must round-trip it
+  (`Layer/RoundTrip`). `ErrNotModified` re-confirms the copy and leaves its
+  bound as it was; an `ErrNotModified` returned together with an `Entry`
+  carrying a new `Expires` renews it. A past `Expires` is a value stale on
+  arrival: served to the caller that loaded it, kept only within
+  `WithStaleWindow`.
+- **Serve without storing.** An origin that returns an `Entry` with `NoStore`
+  set has it served to the caller — `GetEntry` shows the flag — and stored in
+  no layer, and any fill lease it held is released. It is for a value that is
+  correct to serve and wrong to keep (bytes whose recorded length disagrees
+  with what was read), where the alternative is failing the read. Callers in
+  the process still share the one load; under `FillLease`, processes waiting
+  on the lease wait it out and then load for themselves, as they do for a
+  negative entry with negative caching off.
 - **Fill-once.** Concurrent misses for one key in one partition share one load
   in a process (`FillSingleflight`, the default). With `FillLease`, the
   deepest tier that declares `Leases` (the most widely shared) grants one fill
@@ -575,6 +596,21 @@ conforms. `Layer` and `Leaser` are unchanged; the Memory layer is also a
 The definition's configuration group is unchanged, so core's structural check
 finds nothing; the bump to 0.3.0 is the behavioural judgement, and every
 provider must declare `codefly.dev/cache@0.3.0`.
+
+Since 0.3.0, unreleased — the notes of the next version, whose number is the
+release's call:
+
+- **New, for origins:** `Entry.Expires`, the origin's own bound on a value,
+  honoured in every mode and clamping every tier's TTL; `Entry.NoStore`, a
+  value served to the caller and stored in no layer; `ErrNotModified` may be
+  returned with an `Entry` carrying a new `Expires`. Both fields are zero by
+  default and nothing on 0.3.0 could set them, so no existing consumer's
+  behaviour changes.
+- **For drivers:** a layer must round-trip `Entry.Expires` as it does
+  `Confirmed` and `Sequence`; `cachetest.Run`'s `Layer/RoundTrip` holds it to
+  that. A driver that drops the field lets a copy outlive the origin's bound
+  in the tiers refilled from it. `Memory` round-trips it; `service-redis/cache`
+  must add it to its entry encoding before it moves to this version.
 
 ## Test
 
