@@ -52,6 +52,7 @@ type Stack struct {
 	behindErrors    func(key string, err error)
 	behindQueue     int
 	observer        func(Event)
+	observerErrors  func(Event, any)
 	leaseTTLSet     bool // WithLeaseTTL was given, so it does not follow loadTimeout
 	// mint is how a missing generation is minted: with a lease when a tier
 	// grants them, fenced when every tier fences, else unguarded.
@@ -312,6 +313,23 @@ func WithExecutor(run func(task func())) Option {
 // WithWriteBehindErrors reports each WriteBehind write that was dropped: one
 // the origin refused five times in a row, and one still queued when the stack
 // was closed without a Drain. Stack.Drain also returns them.
+// WithObserverErrors reports an observer that panicked: the event it was given
+// and what it panicked with. The event is dropped and the operation goes on
+// regardless — see Stack.report — so this is how a consumer learns its own
+// observer is broken, rather than how the stack recovers from it.
+//
+// Without it a panicking observer is contained and its panic discarded: this
+// package has no logger of its own, so there is nowhere else for it to go.
+func WithObserverErrors(fn func(ev Event, panicked any)) Option {
+	return func(s *Stack) error {
+		if fn == nil {
+			return errors.New("cache: WithObserverErrors: nil handler")
+		}
+		s.observerErrors = fn
+		return nil
+	}
+}
+
 func WithWriteBehindErrors(fn func(key string, err error)) Option {
 	return func(s *Stack) error { s.behindErrors = fn; return nil }
 }

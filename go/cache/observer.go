@@ -156,6 +156,20 @@ func (s *Stack) observe(f fill, tier int, outcome Outcome, err error, start time
 
 // report sends ev to the observer, with Elapsed measured from start when
 // start is set.
+//
+// A panicking observer is contained here. Every event is reported on the
+// goroutine doing the operation, so without this an observer that panics —
+// a nil map written to, a type assertion on an Err it did not expect — unwinds
+// out through the caller's Get, turning a read that the cache answered
+// correctly into a failed request. Telemetry is not worth a read, so the event
+// is dropped and the operation goes on.
+//
+// The observer is NOT disabled afterwards: a panic from a transient condition
+// would then cost every later event too, which is a worse failure than the one
+// being contained. A consumer that wants to know installs WithObserverErrors;
+// with none, the panic is discarded, because this package has no logger to put
+// it in. A handler that panics in turn is contained the same way, so one broken
+// callback cannot reach the caller through the other.
 func (s *Stack) report(ev Event, start time.Time) {
 	if s.observer == nil {
 		return
@@ -163,6 +177,14 @@ func (s *Stack) report(ev Event, start time.Time) {
 	if !start.IsZero() {
 		ev.Elapsed = s.clock.Now().Sub(start)
 	}
+	defer func() {
+		panicked := recover()
+		if panicked == nil || s.observerErrors == nil {
+			return
+		}
+		defer func() { _ = recover() }()
+		s.observerErrors(ev, panicked)
+	}()
 	s.observer(ev)
 }
 

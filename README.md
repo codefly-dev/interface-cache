@@ -457,7 +457,12 @@ plain cache's `ErrMiss` hides: a tier that held nothing (`Miss`) and one that
 could not be reached (`Failed`, with the error) are different events.
 
 The observer runs on the goroutine doing the operation, so it must be quick,
-must not block and must not call the stack; feed a metrics backend from it.
+must not block and must not call the stack; feed a metrics backend from it. It
+may not, however, take a read down with it: an observer that panics is
+contained, its event dropped, and the operation goes on — telemetry is not
+worth a read the cache answered correctly. One panic does not disable it, and
+`WithObserverErrors` reports the panic and the event it was given, so a broken
+observer is discoverable rather than silent.
 Keys are passed as they are: what to aggregate on, and at what cardinality, is
 the consumer's decision. The generation reads that precede every read over an
 origin are bookkeeping and are not reported. Without `WithObserver` nothing is

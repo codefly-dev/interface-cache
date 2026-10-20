@@ -211,3 +211,74 @@ func TestObserverReportsRefreshes(t *testing.T) {
 	assertGet(t, s, "k", "v")
 	wantEvents(t, &r, "Get 0:Hit, Refresh origin:NotModified")
 }
+
+// An observer that panics must not take the read with it. Every event is
+// reported on the goroutine doing the operation, so a nil map written to or a
+// type assertion on an unexpected Err would otherwise unwind out through the
+// caller's Get and fail a read the cache had answered correctly.
+func TestAPanickingObserverDoesNotFailTheRead(t *testing.T) {
+	o := newOrigin()
+	o.put("k", "v")
+	var seen int
+	s := newStack(t, cache.WithTier(cache.NewMemory(), time.Minute), cache.WithOrigin(o),
+		cache.WithObserver(func(cache.Event) { seen++; panic("observer blew up") }))
+
+	// The value is served, every time, however often the observer panics.
+	assertGet(t, s, "k", "v")
+	assertGet(t, s, "k", "v")
+
+	// And the observer is still being called: one panic does not disable it,
+	// which would cost every later event for one transient fault.
+	if seen < 3 {
+		t.Fatalf("the observer was called %d times; it was disabled after panicking", seen)
+	}
+}
+
+// The panic reaches the consumer through WithObserverErrors, with the event the
+// observer was given — so a broken observer is discoverable rather than silent.
+func TestAPanickingObserverIsReportedToItsHandler(t *testing.T) {
+	o := newOrigin()
+	o.put("k", "v")
+	type failure struct {
+		ev       cache.Event
+		panicked any
+	}
+	var mu sync.Mutex
+	var failures []failure
+	s := newStack(t, cache.WithTier(cache.NewMemory(), time.Minute), cache.WithOrigin(o),
+		cache.WithObserver(func(cache.Event) { panic("observer blew up") }),
+		cache.WithObserverErrors(func(ev cache.Event, panicked any) {
+			mu.Lock()
+			defer mu.Unlock()
+			failures = append(failures, failure{ev, panicked})
+		}))
+
+	assertGet(t, s, "k", "v")
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(failures) == 0 {
+		t.Fatal("a panicking observer was not reported to the handler")
+	}
+	if failures[0].panicked != "observer blew up" {
+		t.Fatalf("the handler got %v, want what the observer panicked with", failures[0].panicked)
+	}
+	if failures[0].ev.Key != "k" {
+		t.Fatalf("the handler got event %+v, want the one the observer was given", failures[0].ev)
+	}
+	if _, err := cache.New(context.Background(),
+		cache.WithTier(cache.NewMemory(), time.Minute), cache.WithObserverErrors(nil)); err == nil {
+		t.Fatal("New accepted a nil observer-error handler")
+	}
+}
+
+// A handler that panics in turn is contained the same way: one broken callback
+// cannot reach the caller through the other.
+func TestAPanickingObserverErrorHandlerIsContainedToo(t *testing.T) {
+	o := newOrigin()
+	o.put("k", "v")
+	s := newStack(t, cache.WithTier(cache.NewMemory(), time.Minute), cache.WithOrigin(o),
+		cache.WithObserver(func(cache.Event) { panic("observer blew up") }),
+		cache.WithObserverErrors(func(cache.Event, any) { panic("handler blew up too") }))
+	assertGet(t, s, "k", "v")
+}
