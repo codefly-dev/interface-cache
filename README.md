@@ -16,7 +16,7 @@ runtime. Roadmap: [codefly-dev/.github#7](https://github.com/codefly-dev/.github
 | Path | What |
 |---|---|
 | `interface.codefly.yaml` | The published definition, `codefly.dev/cache@0.3.0`, in core's format: type `capability`, the `cache` configuration group (`driver`; `connection`, secret). Providers are held to it. See [The published definition](#the-published-definition). |
-| `definition` | A module of its own that holds the definition to core's checks (core's loader, the Go constants, a provider's emitted configuration, evolution between published versions), so `go/cache` never depends on core. `definition/published/` records every published version. |
+| `definition` | A module of its own that holds the definition to core's checks (core's loader, the Go constants, a provider's emitted configuration, evolution between published versions), so `go/cache` never depends on core, and holds the newest published version of each [driver](#drivers) to the `go/cache` of the same commit. `definition/published/` records every published version. |
 | `go/cache` | `Layer`, `Source`, `Store`, `Partition`, the `Stack` (any number of layers), [consistency modes](#consistency-modes) and `Capabilities`, [`WithObserver` events](#observability), `Open` + driver registry, `Typed[T]`, and `Memory`: a complete in-process backend that declares every layer capability (leases, notifications, flush, fenced fills, a byte budget; `Share()` gives several stacks one store). Depends on nothing but `golang.org/x/sync`. |
 | `go/cache/cachetest` | Conformance suite: `Run` (the Layer contract, the layer's declared `Capabilities` against its behaviour: Leaser, Notifier, Resyncer, Fencer, byte budget) and `RunStack` (fill-once across processes, partition isolation, eviction on external writes and resyncs, a property test per mode, every [pitfall](#pitfalls) as a scenario, and the [simulation](#simulation)). A harness may provide `ExternalWrite` (change a key bypassing the driver) and must provide `Interrupt` for a Resyncer. Benchmarks per mode are in its tests. |
 | `go/sources/objectstorage` | Origin adapter over the object-storage gateway client: loads conditional on ETag (it declares `ConditionalLoads`, so it keeps `Validated`). Safe only behind the consumer's own authorization check (see [Partitions](#partitions-and-authorization)). |
@@ -57,12 +57,22 @@ an undeclared key rather than let consumers start reading it.
 
 ### Drivers
 
-| Driver | Go package | Provider |
-|---|---|---|
-| `redis` | `github.com/codefly-dev/service-redis/cache` | `service-redis` |
+| Driver | Go package | Provider | Builds against this `go/cache` |
+|---|---|---|---|
+| `redis` | `github.com/codefly-dev/service-redis/cache` | `service-redis` | yes |
 
 Core's format has no place for drivers, so they are listed here. A provider
 adds its row when its driver passes `cachetest`.
+
+The last column is checked, not declared: `definition`'s tests fetch the newest
+published version of each listed driver, point a copy of it at the `go/cache`
+of the same commit and build, vet and test it, so a change to `Entry` or to a
+layer or origin interface fails the PR that makes it, not the consumer that
+finds it. A PR that knowingly breaks a driver sets its row to
+`no (port: <link>)`, naming the driver's port, and the test then holds it to
+that: the driver must not build, and the row must return to `yes` as soon as
+the port is published. The driver's conformance run against the server its
+agent runs stays in its own repository.
 
 ### Providing it
 
@@ -598,6 +608,13 @@ untagged, a module that needs it builds against it with a `replace` directive,
 dropped once `go/cache` is tagged. A driver pins the `go/cache` version it
 implements.
 
+A change to the Go API that the newest published driver cannot build against
+fails CI here on the PR that makes it (see [Drivers](#drivers)). It merges
+only with the break acknowledged in the Drivers table, naming the driver's
+port; the driver then moves to the tagged `go/cache` and publishes, and the
+row returns to `yes`, which CI requires as soon as the port is out. The
+window between the two releases is a documented one, never a surprise.
+
 0.2.0 is a breaking change: every `Stack` and `Typed` operation takes a
 `Partition`, the stack's keys in a layer change (see Limits), and `RunStack`
 gains the partition cases under a `Partitions` subtest. The Notifier contract
@@ -668,6 +685,7 @@ cd go/sources/objectstorage && go test -race -count=1 -timeout 30m ./...
 simulation's fixed seeds included; see [Simulation](#simulation) for replaying
 a seed and the longer randomized run.
 
-`definition` runs against core v0.19.4's loader and checks, and reads the `v*`
-tags from git. `go/sources/objectstorage` installs the object-storage gateway at the version
+`definition` runs against core v0.19.4's loader and checks, reads the `v*`
+tags from git, and fetches the newest published version of each driver in the
+[Drivers](#drivers) table from the module proxy to build it against `go/cache`. `go/sources/objectstorage` installs the object-storage gateway at the version
 its `go.mod` pins and runs it on the in-memory backend.

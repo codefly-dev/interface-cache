@@ -63,6 +63,7 @@ go test -race -count=1 -v -timeout 30m ./...
 ```
 
 Keep `-timeout 30m`: the first run installs the object-storage gateway.
+`definition`'s tests reach the module proxy for the published drivers.
 
 ## Rules that bite
 
@@ -103,6 +104,18 @@ Keep `-timeout 30m`: the first run installs the object-storage gateway.
   `definition/conformance_test.go` is what service-redis's
   `CreateConnectionConfiguration` returns, commit named. When service-redis
   changes what it emits, update it from there, never to make a check pass.
+- **A published driver builds against this commit's `go/cache`.**
+  `TestPublishedDriversBuildAgainstThisCache`, in `definition`, fetches the
+  newest published version of each driver in the README's Drivers table,
+  points a copy of it at `../go/cache` and tidies, builds, vets and tests it,
+  so a change to `Entry` or to a layer or origin interface fails the PR that
+  makes it, not the consumer that finds it (#21). A deliberate break merges
+  only with the driver's row set to `no (port: …)`, naming the port; the test
+  then requires the break, and requires `yes` back once the port is published,
+  so a stale row is a red `main`, never a silent gate. Never set a row to make
+  the check pass. It builds the driver's module alone: a change to the lease,
+  notification or keying contract must still be run against
+  `service-redis/cache` on its Runtime, in service-redis.
 - **The gateway version in `go/sources/objectstorage/go.mod` follows
   `service-object-storage` releases.** Move it with them.
 - **Partitioning lives in the Stack, never in a driver.** `Partition.layerKey`
