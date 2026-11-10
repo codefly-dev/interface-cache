@@ -21,16 +21,20 @@ type recorder struct {
 	heard map[string]bool // keys the layer's notices delivered to the stack
 }
 
-// notified wraps a stack's notice callback so the recorder sees each key.
+// notified wraps a stack's notice callback so the recorder sees each key. A
+// key is heard once the stack has applied its notice, not when the layer
+// delivers it: fn evicts the copies above and voids the fills racing the key,
+// and a scenario that reads on "heard" before fn has returned reads in the
+// window the notice exists to close, which no layer is bound to close.
 func (r *recorder) notified(fn func(string)) func(string) {
 	return func(key string) {
+		fn(key)
 		r.mu.Lock()
 		if r.heard == nil {
 			r.heard = map[string]bool{}
 		}
 		r.heard[key] = true
 		r.mu.Unlock()
-		fn(key)
 	}
 }
 
